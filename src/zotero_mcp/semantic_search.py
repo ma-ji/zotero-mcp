@@ -9,6 +9,7 @@ over research libraries.
 import json
 import os
 import sys
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -433,98 +434,113 @@ class ZoteroSemanticSearch:
                     # Extract fulltext for items that will be processed (can be parallel).
                     total_to_extract = len(items_to_process)
                     if total_to_extract:
-                        effective_workers = extraction_workers or 1
-                        if effective_workers < 1:
-                            effective_workers = 1
+                        extracted = 0
+                        progress_interval_s = 10.0
+                        progress_stop = threading.Event()
 
-                        if effective_workers == 1 or total_to_extract == 1:
-                            extracted = 0
-                            for it in items_to_process:
-                                if not getattr(it, "fulltext", None):
-                                    text = reader.extract_fulltext_for_item(it.item_id)
-                                    if text:
-                                        if isinstance(text, tuple) and len(text) == 2:
-                                            it.fulltext, it.fulltext_source = text[0], text[1]
-                                        else:
-                                            it.fulltext = text
-                                extracted += 1
-                                if extracted % 25 == 0 and total_to_extract:
+                        def _write_extraction_progress() -> None:
+                            try:
+                                sys.stderr.write(
+                                    f"Extracted content for {extracted}/{total_to_extract} items (skipped {skipped_existing} existing, updating {updated_existing})...\n"
+                                )
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+
+                        def _progress_reporter() -> None:
+                            while not progress_stop.wait(progress_interval_s):
+                                _write_extraction_progress()
+
+                        _write_extraction_progress()
+                        reporter_thread = threading.Thread(
+                            target=_progress_reporter, daemon=True
+                        )
+                        reporter_thread.start()
+
+                        try:
+                            effective_workers = extraction_workers or 1
+                            if effective_workers < 1:
+                                effective_workers = 1
+
+                            if effective_workers == 1 or total_to_extract == 1:
+                                for it in items_to_process:
+                                    if not getattr(it, "fulltext", None):
+                                        text = reader.extract_fulltext_for_item(it.item_id)
+                                        if text:
+                                            if isinstance(text, tuple) and len(text) == 2:
+                                                it.fulltext, it.fulltext_source = text[0], text[1]
+                                            else:
+                                                it.fulltext = text
+                                    extracted += 1
+                            else:
+                                from concurrent.futures import ProcessPoolExecutor, as_completed
+                                import multiprocessing as mp
+
+                                from .fulltext_worker import (
+                                    extract_fulltext_for_item,
+                                    init_fulltext_worker,
+                                )
+
+                                gpu_ids = docling_gpu_ids
+                                if gpu_ids is None and (docling_device or "auto").strip().lower() != "cpu":
+                                    raw_visible = os.getenv("CUDA_VISIBLE_DEVICES")
+                                    if raw_visible:
+                                        parts = [p.strip() for p in raw_visible.split(",") if p.strip()]
+                                        if parts:
+                                            gpu_ids = parts
+                                    if gpu_ids is None:
+                                        try:
+                                            import torch
+
+                                            if torch.cuda.is_available():
+                                                count = torch.cuda.device_count()
+                                                if count > 0:
+                                                    gpu_ids = [str(i) for i in range(count)]
+                                        except Exception:
+                                            pass
+
+                                if gpu_ids and effective_workers > len(gpu_ids):
                                     try:
                                         sys.stderr.write(
-                                            f"Extracted content for {extracted}/{total_to_extract} items (skipped {skipped_existing} existing, updating {updated_existing})...\n"
+                                            f"Warning: {effective_workers} extraction workers over {len(gpu_ids)} GPUs may OOM; consider lowering workers or batch sizes.\n"
                                         )
                                     except Exception:
                                         pass
-                        else:
-                            from concurrent.futures import ProcessPoolExecutor, as_completed
-                            import multiprocessing as mp
 
-                            from .fulltext_worker import (
-                                extract_fulltext_for_item,
-                                init_fulltext_worker,
-                            )
-
-                            gpu_ids = docling_gpu_ids
-                            if gpu_ids is None and (docling_device or "auto").strip().lower() != "cpu":
-                                raw_visible = os.getenv("CUDA_VISIBLE_DEVICES")
-                                if raw_visible:
-                                    parts = [p.strip() for p in raw_visible.split(",") if p.strip()]
-                                    if parts:
-                                        gpu_ids = parts
-                                if gpu_ids is None:
-                                    try:
-                                        import torch
-
-                                        if torch.cuda.is_available():
-                                            count = torch.cuda.device_count()
-                                            if count > 0:
-                                                gpu_ids = [str(i) for i in range(count)]
-                                    except Exception:
-                                        pass
-
-                            if gpu_ids and effective_workers > len(gpu_ids):
-                                try:
-                                    sys.stderr.write(
-                                        f"Warning: {effective_workers} extraction workers over {len(gpu_ids)} GPUs may OOM; consider lowering workers or batch sizes.\n"
-                                    )
-                                except Exception:
-                                    pass
-
-                            extracted = 0
-                            ctx = mp.get_context("spawn")
-                            with ProcessPoolExecutor(
-                                max_workers=effective_workers,
-                                mp_context=ctx,
-                                initializer=init_fulltext_worker,
-                                initargs=(
-                                    zotero_db_path,
-                                    pdf_max_pages,
-                                    docling_device,
-                                    docling_num_threads,
-                                    gpu_ids,
-                                ),
-                            ) as executor:
-                                futures = {
-                                    executor.submit(extract_fulltext_for_item, it.item_id): it
-                                    for it in items_to_process
-                                }
-                                for fut in as_completed(futures):
-                                    it = futures[fut]
-                                    try:
-                                        _, text, source = fut.result()
-                                        if text:
-                                            it.fulltext = text
-                                            it.fulltext_source = source
-                                    except Exception:
-                                        pass
-                                    extracted += 1
-                                    if extracted % 25 == 0 and total_to_extract:
+                                ctx = mp.get_context("spawn")
+                                with ProcessPoolExecutor(
+                                    max_workers=effective_workers,
+                                    mp_context=ctx,
+                                    initializer=init_fulltext_worker,
+                                    initargs=(
+                                        zotero_db_path,
+                                        pdf_max_pages,
+                                        docling_device,
+                                        docling_num_threads,
+                                        gpu_ids,
+                                    ),
+                                ) as executor:
+                                    futures = {
+                                        executor.submit(extract_fulltext_for_item, it.item_id): it
+                                        for it in items_to_process
+                                    }
+                                    for fut in as_completed(futures):
+                                        it = futures[fut]
                                         try:
-                                            sys.stderr.write(
-                                                f"Extracted content for {extracted}/{total_to_extract} items (skipped {skipped_existing} existing, updating {updated_existing})...\n"
-                                            )
+                                            _, text, source = fut.result()
+                                            if text:
+                                                it.fulltext = text
+                                                it.fulltext_source = source
                                         except Exception:
                                             pass
+                                        extracted += 1
+                        finally:
+                            progress_stop.set()
+                            try:
+                                reporter_thread.join(timeout=1.0)
+                            except Exception:
+                                pass
+                            _write_extraction_progress()
 
                     # Replace local_items with filtered list
                     local_items = items_to_process
