@@ -273,6 +273,79 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
         config["embedding_model"] = hf_model
         print(f"Using HuggingFace embedding model: {hf_model}")
 
+    # Configure local embedding performance (optional)
+    if config.get("embedding_model") not in ("openai", "gemini"):
+        existing_embedding_config = (existing_semantic_config or {}).get("embedding_config", {}) or {}
+        embedding_cfg = config.setdefault("embedding_config", {})
+
+        print("\n=== Embedding Performance Settings (Advanced) ===")
+        print("These settings apply to local sentence-transformers models (default/HuggingFace).")
+        print("If you hit CUDA OOM, reduce batch size and/or disable multi-process.")
+
+        default_batch = existing_embedding_config.get("batch_size", 32)
+        while True:
+            raw = input(f"Embedding batch size [{default_batch}]: ").strip()
+            if raw == "":
+                embedding_cfg["batch_size"] = default_batch
+                break
+            try:
+                batch_size = int(raw)
+                if batch_size > 0:
+                    embedding_cfg["batch_size"] = batch_size
+                    break
+                print("Please enter a positive integer")
+            except ValueError:
+                print("Please enter a valid number")
+
+        default_multi = bool(existing_embedding_config.get("multi_process", False))
+        mp_hint = "Y/n" if default_multi else "y/N"
+        raw = input(f"Enable multi-process embedding (multi-GPU) [{mp_hint}]: ").strip().lower()
+        if raw == "":
+            embedding_cfg["multi_process"] = default_multi
+        else:
+            embedding_cfg["multi_process"] = raw in {"y", "yes", "true", "1"}
+
+        # Optional chunk size (helps control memory when multi_process=True)
+        default_chunk = existing_embedding_config.get("chunk_size")
+        raw = input(f"Embedding chunk size (optional) [{default_chunk or 'auto'}]: ").strip()
+        if raw == "":
+            if default_chunk is not None:
+                embedding_cfg["chunk_size"] = default_chunk
+        else:
+            try:
+                chunk_size = int(raw)
+                if chunk_size > 0:
+                    embedding_cfg["chunk_size"] = chunk_size
+            except ValueError:
+                print("Warning: invalid chunk size, using auto")
+
+        # Devices: for multi-process use devices/gpu_ids; for single-process use device
+        # Clear old settings first so config reflects the user's choice.
+        embedding_cfg.pop("devices", None)
+        embedding_cfg.pop("gpu_ids", None)
+        embedding_cfg.pop("device", None)
+
+        if embedding_cfg.get("multi_process"):
+            default_devices = existing_embedding_config.get("devices")
+            if isinstance(default_devices, list):
+                default_devices_str = ",".join(str(d) for d in default_devices)
+            else:
+                default_devices_str = ""
+            raw = input(
+                f"Embedding devices (comma-separated, optional) [{default_devices_str or 'auto'}]: "
+            ).strip()
+            if raw:
+                parts = [p.strip() for p in raw.split(",") if p.strip()]
+                if parts and all(p.isdigit() for p in parts):
+                    embedding_cfg["gpu_ids"] = [int(p) for p in parts]
+                else:
+                    embedding_cfg["devices"] = parts
+        else:
+            default_device = existing_embedding_config.get("device", "")
+            raw = input(f"Embedding device (optional) [{default_device or 'auto'}]: ").strip()
+            if raw:
+                embedding_cfg["device"] = raw
+
     # Configure update frequency
     print("\n=== Database Update Configuration ===")
     print("Configure how often the semantic search database is updated:")
@@ -342,6 +415,61 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
         except ValueError:
             print("Please enter a valid number")
 
+    existing_extraction_config = (existing_semantic_config or {}).get("extraction", {}) or {}
+    print("\nParallel extraction can speed up `update-db --fulltext` but uses more CPU/RAM/GPU.")
+    default_workers = existing_extraction_config.get("workers", 1)
+    while True:
+        raw = input(f"Fulltext extraction workers [{default_workers}]: ").strip()
+        if raw == "":
+            extraction_workers = default_workers
+            break
+        try:
+            extraction_workers = int(raw)
+            if extraction_workers > 0:
+                break
+            print("Please enter a positive integer")
+        except ValueError:
+            print("Please enter a valid number")
+
+    default_device = existing_extraction_config.get("docling_device", "auto")
+    while True:
+        raw = input(f"Docling device (auto/cpu/cuda/mps) [{default_device}]: ").strip().lower()
+        if raw == "":
+            docling_device = default_device
+            break
+        if raw in {"auto", "cpu", "cuda", "mps"}:
+            docling_device = raw
+            break
+        print("Please enter one of: auto, cpu, cuda, mps")
+
+    default_threads = existing_extraction_config.get("docling_num_threads", 4)
+    while True:
+        raw = input(f"Docling num threads [{default_threads}]: ").strip()
+        if raw == "":
+            docling_num_threads = default_threads
+            break
+        try:
+            docling_num_threads = int(raw)
+            if docling_num_threads > 0:
+                break
+            print("Please enter a positive integer")
+        except ValueError:
+            print("Please enter a valid number")
+
+    default_gpu_ids = existing_extraction_config.get("gpu_ids")
+    if isinstance(default_gpu_ids, list):
+        default_gpu_ids_str = ",".join(str(x) for x in default_gpu_ids)
+    elif isinstance(default_gpu_ids, str):
+        default_gpu_ids_str = default_gpu_ids
+    else:
+        default_gpu_ids_str = ""
+    raw = input(f"Docling GPU ids (optional, comma-separated) [{default_gpu_ids_str or 'auto'}]: ").strip()
+    gpu_ids = None
+    if raw:
+        gpu_ids = [p.strip() for p in raw.split(",") if p.strip()]
+        if gpu_ids and all(p.isdigit() for p in gpu_ids):
+            gpu_ids = [int(p) for p in gpu_ids]
+
     # Configure Zotero database path
     print("\n=== Zotero Database Path ===")
     print("By default, zotero-mcp auto-detects the Zotero database location.")
@@ -367,7 +495,15 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
         print("Using auto-detect for Zotero database location.")
 
     config["update_config"] = update_config
-    config["extraction"] = {"pdf_max_pages": pdf_max_pages}
+    extraction_config = {
+        "pdf_max_pages": pdf_max_pages,
+        "workers": extraction_workers,
+        "docling_device": docling_device,
+        "docling_num_threads": docling_num_threads,
+    }
+    if gpu_ids:
+        extraction_config["gpu_ids"] = gpu_ids
+    config["extraction"] = extraction_config
     if zotero_db_path:
         config["zotero_db_path"] = zotero_db_path
 

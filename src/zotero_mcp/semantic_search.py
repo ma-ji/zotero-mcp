@@ -274,6 +274,10 @@ class ZoteroSemanticSearch:
         try:
             # Load per-run config, including extraction limits and db path if provided
             pdf_max_pages = None
+            extraction_workers: int | None = None
+            docling_device: str | None = None
+            docling_num_threads: int | None = None
+            docling_gpu_ids: list[str] | None = None
             zotero_db_path = self.db_path  # CLI override takes precedence
             # If semantic_search config file exists, prefer its setting
             try:
@@ -281,14 +285,57 @@ class ZoteroSemanticSearch:
                     with open(self.config_path) as _f:
                         _cfg = json.load(_f)
                         semantic_cfg = _cfg.get('semantic_search', {})
-                        pdf_max_pages = semantic_cfg.get('extraction', {}).get('pdf_max_pages')
+                        extraction_cfg = semantic_cfg.get('extraction', {}) or {}
+                        pdf_max_pages = extraction_cfg.get('pdf_max_pages')
+                        extraction_workers = extraction_cfg.get("workers")
+                        docling_device = extraction_cfg.get("docling_device")
+                        docling_num_threads = extraction_cfg.get("docling_num_threads")
+                        docling_gpu_ids = extraction_cfg.get("gpu_ids")
                         # Use config db_path only if no CLI override
                         if not zotero_db_path:
                             zotero_db_path = semantic_cfg.get('zotero_db_path')
             except Exception:
                 pass
 
-            with suppress_stdout(), LocalZoteroReader(db_path=zotero_db_path, pdf_max_pages=pdf_max_pages) as reader:
+            # Allow env overrides for parallel extraction (env > config).
+            raw = os.getenv("ZOTERO_FULLTEXT_WORKERS")
+            if raw:
+                try:
+                    value = int(raw)
+                    if value > 0:
+                        extraction_workers = value
+                except ValueError:
+                    pass
+
+            raw = os.getenv("ZOTERO_DOCLING_DEVICE")
+            if raw and raw.strip():
+                docling_device = raw.strip()
+
+            raw = os.getenv("ZOTERO_DOCLING_NUM_THREADS")
+            if raw:
+                try:
+                    value = int(raw)
+                    if value > 0:
+                        docling_num_threads = value
+                except ValueError:
+                    pass
+
+            raw = os.getenv("ZOTERO_DOCLING_GPU_IDS")
+            if raw:
+                docling_gpu_ids = [p.strip() for p in raw.split(",") if p.strip()]
+            elif isinstance(docling_gpu_ids, str):
+                docling_gpu_ids = [p.strip() for p in docling_gpu_ids.split(",") if p.strip()]
+            elif isinstance(docling_gpu_ids, list):
+                docling_gpu_ids = [str(p).strip() for p in docling_gpu_ids if str(p).strip()]
+            else:
+                docling_gpu_ids = None
+
+            with suppress_stdout(), LocalZoteroReader(
+                db_path=zotero_db_path,
+                pdf_max_pages=pdf_max_pages,
+                docling_device=docling_device,
+                docling_num_threads=docling_num_threads,
+            ) as reader:
                 # Phase 1: fetch metadata only (fast)
                 sys.stderr.write("Scanning local Zotero database for items...\n")
                 local_items = reader.get_items_with_text(limit=limit, include_fulltext=False)
@@ -358,7 +405,6 @@ class ZoteroSemanticSearch:
 
                 # Phase 2: selectively extract fulltext only when requested
                 if extract_fulltext:
-                    extracted = 0
                     skipped_existing = 0
                     updated_existing = 0
                     items_to_process = []
@@ -382,23 +428,103 @@ class ZoteroSemanticSearch:
                                     skipped_existing += 1
 
                         if should_extract:
-                            # Extract fulltext if item doesn't have it yet
-                            if not getattr(it, "fulltext", None):
-                                text = reader.extract_fulltext_for_item(it.item_id)
-                                if text:
-                                    # Support new (text, source) return format
-                                    if isinstance(text, tuple) and len(text) == 2:
-                                        it.fulltext, it.fulltext_source = text[0], text[1]
-                                    else:
-                                        it.fulltext = text
-                            extracted += 1
                             items_to_process.append(it)
 
-                            if extracted % 25 == 0 and total_to_extract:
+                    # Extract fulltext for items that will be processed (can be parallel).
+                    total_to_extract = len(items_to_process)
+                    if total_to_extract:
+                        effective_workers = extraction_workers or 1
+                        if effective_workers < 1:
+                            effective_workers = 1
+
+                        if effective_workers == 1 or total_to_extract == 1:
+                            extracted = 0
+                            for it in items_to_process:
+                                if not getattr(it, "fulltext", None):
+                                    text = reader.extract_fulltext_for_item(it.item_id)
+                                    if text:
+                                        if isinstance(text, tuple) and len(text) == 2:
+                                            it.fulltext, it.fulltext_source = text[0], text[1]
+                                        else:
+                                            it.fulltext = text
+                                extracted += 1
+                                if extracted % 25 == 0 and total_to_extract:
+                                    try:
+                                        sys.stderr.write(
+                                            f"Extracted content for {extracted}/{total_to_extract} items (skipped {skipped_existing} existing, updating {updated_existing})...\n"
+                                        )
+                                    except Exception:
+                                        pass
+                        else:
+                            from concurrent.futures import ProcessPoolExecutor, as_completed
+                            import multiprocessing as mp
+
+                            from .fulltext_worker import (
+                                extract_fulltext_for_item,
+                                init_fulltext_worker,
+                            )
+
+                            gpu_ids = docling_gpu_ids
+                            if gpu_ids is None and (docling_device or "auto").strip().lower() != "cpu":
+                                raw_visible = os.getenv("CUDA_VISIBLE_DEVICES")
+                                if raw_visible:
+                                    parts = [p.strip() for p in raw_visible.split(",") if p.strip()]
+                                    if parts:
+                                        gpu_ids = parts
+                                if gpu_ids is None:
+                                    try:
+                                        import torch
+
+                                        if torch.cuda.is_available():
+                                            count = torch.cuda.device_count()
+                                            if count > 0:
+                                                gpu_ids = [str(i) for i in range(count)]
+                                    except Exception:
+                                        pass
+
+                            if gpu_ids and effective_workers > len(gpu_ids):
                                 try:
-                                    sys.stderr.write(f"Extracted content for {extracted}/{total_to_extract} items (skipped {skipped_existing} existing, updating {updated_existing})...\n")
+                                    sys.stderr.write(
+                                        f"Warning: {effective_workers} extraction workers over {len(gpu_ids)} GPUs may OOM; consider lowering workers or batch sizes.\n"
+                                    )
                                 except Exception:
                                     pass
+
+                            extracted = 0
+                            ctx = mp.get_context("spawn")
+                            with ProcessPoolExecutor(
+                                max_workers=effective_workers,
+                                mp_context=ctx,
+                                initializer=init_fulltext_worker,
+                                initargs=(
+                                    zotero_db_path,
+                                    pdf_max_pages,
+                                    docling_device,
+                                    docling_num_threads,
+                                    gpu_ids,
+                                ),
+                            ) as executor:
+                                futures = {
+                                    executor.submit(extract_fulltext_for_item, it.item_id): it
+                                    for it in items_to_process
+                                }
+                                for fut in as_completed(futures):
+                                    it = futures[fut]
+                                    try:
+                                        _, text, source = fut.result()
+                                        if text:
+                                            it.fulltext = text
+                                            it.fulltext_source = source
+                                    except Exception:
+                                        pass
+                                    extracted += 1
+                                    if extracted % 25 == 0 and total_to_extract:
+                                        try:
+                                            sys.stderr.write(
+                                                f"Extracted content for {extracted}/{total_to_extract} items (skipped {skipped_existing} existing, updating {updated_existing})...\n"
+                                            )
+                                        except Exception:
+                                            pass
 
                     # Replace local_items with filtered list
                     local_items = items_to_process

@@ -201,6 +201,24 @@ def main():
                                  help="Limit number of items to process (for testing)")
     update_db_parser.add_argument("--fulltext", action="store_true",
                                  help="Extract fulltext content from local Zotero database (slower but more comprehensive)")
+    update_db_parser.add_argument("--fulltext-workers", type=int,
+                                 help="Parallel worker processes for fulltext extraction (overrides config/env)")
+    update_db_parser.add_argument("--docling-device", choices=["auto", "cpu", "cuda", "mps"],
+                                 help="Docling accelerator device for fulltext extraction (overrides config/env)")
+    update_db_parser.add_argument("--docling-num-threads", type=int,
+                                 help="Docling threads per worker process (overrides config/env)")
+    update_db_parser.add_argument("--docling-gpu-ids",
+                                 help="Comma-separated GPU ids for Docling extraction workers (overrides config/env)")
+    update_db_parser.add_argument("--embedding-device",
+                                 help="Device for local embeddings (e.g. cpu, cuda, cuda:0) (overrides config/env)")
+    update_db_parser.add_argument("--embedding-batch-size", type=int,
+                                 help="Batch size for local embeddings; lower values reduce OOM risk (overrides config/env)")
+    update_db_parser.add_argument("--embedding-chunk-size", type=int,
+                                 help="Chunk size for multi-process embeddings (overrides config/env)")
+    update_db_parser.add_argument("--embedding-multi-process", action="store_true",
+                                 help="Enable multi-process embedding (uses multiple GPUs if available)")
+    update_db_parser.add_argument("--embedding-devices",
+                                 help="Comma-separated devices for multi-process embeddings (e.g. cuda:0,cuda:1) (overrides config/env)")
     update_db_parser.add_argument("--config-path",
                                  help="Path to semantic search configuration file")
     update_db_parser.add_argument("--db-path",
@@ -374,6 +392,32 @@ def main():
             config_path = Path(config_path)
 
         print(f"Using configuration: {config_path}")
+
+        # Apply per-run performance overrides via environment variables (used by semantic_search/chroma_client)
+        if getattr(args, "fulltext_workers", None):
+            if args.fulltext_workers > 0:
+                os.environ["ZOTERO_FULLTEXT_WORKERS"] = str(args.fulltext_workers)
+        if getattr(args, "docling_device", None):
+            os.environ["ZOTERO_DOCLING_DEVICE"] = str(args.docling_device)
+        if getattr(args, "docling_num_threads", None):
+            if args.docling_num_threads > 0:
+                os.environ["ZOTERO_DOCLING_NUM_THREADS"] = str(args.docling_num_threads)
+        if getattr(args, "docling_gpu_ids", None):
+            os.environ["ZOTERO_DOCLING_GPU_IDS"] = str(args.docling_gpu_ids)
+
+        if getattr(args, "embedding_device", None):
+            os.environ["ZOTERO_EMBEDDING_DEVICE"] = str(args.embedding_device)
+        if getattr(args, "embedding_batch_size", None):
+            if args.embedding_batch_size > 0:
+                os.environ["ZOTERO_EMBEDDING_BATCH_SIZE"] = str(args.embedding_batch_size)
+        if getattr(args, "embedding_chunk_size", None):
+            if args.embedding_chunk_size > 0:
+                os.environ["ZOTERO_EMBEDDING_CHUNK_SIZE"] = str(args.embedding_chunk_size)
+        if getattr(args, "embedding_devices", None):
+            os.environ["ZOTERO_EMBEDDING_DEVICES"] = str(args.embedding_devices)
+            os.environ["ZOTERO_EMBEDDING_MULTI_PROCESS"] = "true"
+        if getattr(args, "embedding_multi_process", None) and args.embedding_multi_process:
+            os.environ["ZOTERO_EMBEDDING_MULTI_PROCESS"] = "true"
 
         # Get optional db_path override from CLI
         db_path = getattr(args, 'db_path', None)

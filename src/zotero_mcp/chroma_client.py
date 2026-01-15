@@ -8,10 +8,12 @@ for semantic search over Zotero libraries.
 import json
 import os
 import sys
+import atexit
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import logging
+from threading import Lock
 
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
@@ -109,24 +111,243 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
 class HuggingFaceEmbeddingFunction(EmbeddingFunction):
     """Custom HuggingFace embedding function for ChromaDB using sentence-transformers."""
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        *,
+        embedding_config: dict[str, Any] | None = None,
+        name_override: str | None = None,
+    ):
         self.model_name = model_name
+        self.name_override = name_override
+        self.embedding_config = embedding_config or {}
+        self.batch_size = self._get_int_setting(
+            "batch_size",
+            env_var="ZOTERO_EMBEDDING_BATCH_SIZE",
+            default=32,
+        )
+        self.chunk_size = self._get_int_setting(
+            "chunk_size",
+            env_var="ZOTERO_EMBEDDING_CHUNK_SIZE",
+            default=None,
+        )
+        self.device = os.getenv("ZOTERO_EMBEDDING_DEVICE") or self.embedding_config.get(
+            "device"
+        )
+        if isinstance(self.device, str) and self.device.strip().lower() in {"", "auto"}:
+            self.device = None
+
+        self._pool: dict[str, Any] | None = None
+        self._pool_lock = Lock()
+        self._target_devices = self._get_target_devices()
+        self._use_multi_process = self._resolve_multi_process_setting()
 
         try:
             from sentence_transformers import SentenceTransformer
             logger.info(f"Loading embedding model: {model_name}")
-            self.model = SentenceTransformer(model_name, trust_remote_code=True)
+            load_device = "cpu" if self._use_multi_process else self.device
+            self.model = SentenceTransformer(
+                model_name,
+                trust_remote_code=True,
+                device=load_device,
+            )
         except ImportError:
             raise ImportError("sentence-transformers package is required for HuggingFace embeddings. Install with: pip install sentence-transformers")
 
+        atexit.register(self._stop_pool)
+
     def name(self) -> str:
         """Return the name of this embedding function."""
-        return f"huggingface-{self.model_name}"
+        return self.name_override or f"huggingface-{self.model_name}"
 
     def __call__(self, input: Documents) -> Embeddings:
         """Generate embeddings using HuggingFace model."""
-        embeddings = self.model.encode(input, convert_to_numpy=True)
-        return embeddings.tolist()
+        texts = list(input)
+        if not texts:
+            return []
+
+        try:
+            embeddings = self._encode(texts)
+            return embeddings.tolist()
+        except Exception as e:
+            if not self._is_oom_error(e):
+                raise
+            logger.warning("Embedding OOM; retrying with safer settings: %s", e)
+            embeddings = self._encode_with_oom_fallback(texts)
+            return embeddings.tolist()
+
+    def _get_int_setting(self, key: str, *, env_var: str, default: int | None) -> int | None:
+        raw = os.getenv(env_var)
+        if raw:
+            try:
+                parsed = int(raw)
+                return parsed if parsed > 0 else default
+            except ValueError:
+                return default
+
+        value = self.embedding_config.get(key)
+        if isinstance(value, int):
+            return value if value > 0 else default
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = int(value)
+                return parsed if parsed > 0 else default
+            except ValueError:
+                return default
+        return default
+
+    def _get_target_devices(self) -> list[str] | None:
+        devices = os.getenv("ZOTERO_EMBEDDING_DEVICES") or self.embedding_config.get(
+            "devices"
+        )
+        if isinstance(devices, str):
+            parsed = [p.strip() for p in devices.split(",") if p.strip()]
+            return parsed or None
+        if isinstance(devices, list):
+            parsed = [str(p).strip() for p in devices if str(p).strip()]
+            return parsed or None
+
+        gpu_ids = os.getenv("ZOTERO_EMBEDDING_GPU_IDS") or self.embedding_config.get(
+            "gpu_ids"
+        )
+        if isinstance(gpu_ids, str) and gpu_ids.strip():
+            parsed = [p.strip() for p in gpu_ids.split(",") if p.strip()]
+            return [f"cuda:{p}" for p in parsed] or None
+        if isinstance(gpu_ids, list):
+            parsed = [str(p).strip() for p in gpu_ids if str(p).strip()]
+            return [f"cuda:{p}" for p in parsed] or None
+        return None
+
+    def _ensure_pool(self) -> dict[str, Any] | None:
+        if not self._use_multi_process:
+            return None
+        with self._pool_lock:
+            if self._pool is None:
+                try:
+                    if self._target_devices:
+                        self._pool = self.model.start_multi_process_pool(
+                            target_devices=self._target_devices
+                        )
+                    else:
+                        self._pool = self.model.start_multi_process_pool()
+                except Exception as e:
+                    logger.warning("Failed to start embedding multi-process pool: %s", e)
+                    self._pool = None
+        return self._pool
+
+    def _resolve_multi_process_setting(self) -> bool:
+        raw = os.getenv("ZOTERO_EMBEDDING_MULTI_PROCESS")
+        if isinstance(raw, str) and raw.strip():
+            lowered = raw.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+
+        cfg = self.embedding_config.get("multi_process")
+        if isinstance(cfg, bool):
+            return cfg
+
+        return bool(self._target_devices and len(self._target_devices) > 1)
+
+    def _stop_pool(self) -> None:
+        pool = self._pool
+        if pool is None:
+            return
+        with self._pool_lock:
+            pool = self._pool
+            self._pool = None
+        try:
+            self.model.stop_multi_process_pool(pool)
+        except Exception:
+            pass
+
+    def _encode(self, texts: list[str]):
+        pool = self._ensure_pool()
+        if pool is not None:
+            return self.model.encode_multi_process(
+                texts,
+                pool,
+                batch_size=self.batch_size or 32,
+                chunk_size=self.chunk_size,
+                show_progress_bar=False,
+            )
+        return self.model.encode(
+            texts,
+            batch_size=self.batch_size or 32,
+            chunk_size=self.chunk_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            device=self.device,
+        )
+
+    def _encode_with_oom_fallback(self, texts: list[str]):
+        self._maybe_empty_cuda_cache()
+        self._stop_pool()
+
+        last_exc: Exception | None = None
+        device = self.device
+        if isinstance(device, str) and device.strip().lower() not in {"cpu"}:
+            for bs in self._candidate_batch_sizes(self.batch_size or 32):
+                try:
+                    return self.model.encode(
+                        texts,
+                        batch_size=bs,
+                        show_progress_bar=False,
+                        convert_to_numpy=True,
+                        device=device,
+                    )
+                except Exception as e:
+                    last_exc = e
+                    if not self._is_oom_error(e):
+                        raise
+                    self._maybe_empty_cuda_cache()
+
+        # Final fallback: CPU with small batch size.
+        try:
+            self.model.to("cpu")
+        except Exception:
+            pass
+        for bs in (8, 4, 2, 1):
+            try:
+                return self.model.encode(
+                    texts,
+                    batch_size=bs,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    device="cpu",
+                )
+            except Exception as e:
+                last_exc = e
+                if not self._is_oom_error(e):
+                    raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Failed to encode embeddings after OOM fallbacks")
+
+    def _candidate_batch_sizes(self, start: int) -> list[int]:
+        start = max(1, int(start))
+        candidates = []
+        bs = start
+        while bs >= 1:
+            candidates.append(bs)
+            if bs == 1:
+                break
+            bs = max(1, bs // 2)
+        return candidates
+
+    def _maybe_empty_cuda_cache(self) -> None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _is_oom_error(self, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "out of memory" in msg or "cuda oom" in msg or "cudnn" in msg
 
 
 class ChromaClient:
@@ -212,19 +433,29 @@ class ChromaClient:
 
         elif self.embedding_model == "qwen":
             model_name = self.embedding_config.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
-            return HuggingFaceEmbeddingFunction(model_name=model_name)
+            return HuggingFaceEmbeddingFunction(
+                model_name=model_name, embedding_config=self.embedding_config
+            )
 
         elif self.embedding_model == "embeddinggemma":
             model_name = self.embedding_config.get("model_name", "google/embeddinggemma-300m")
-            return HuggingFaceEmbeddingFunction(model_name=model_name)
+            return HuggingFaceEmbeddingFunction(
+                model_name=model_name, embedding_config=self.embedding_config
+            )
 
         elif self.embedding_model not in ["default", "openai", "gemini"]:
             # Treat any other value as a HuggingFace model name
-            return HuggingFaceEmbeddingFunction(model_name=self.embedding_model)
+            return HuggingFaceEmbeddingFunction(
+                model_name=self.embedding_model, embedding_config=self.embedding_config
+            )
 
         else:
-            # Use ChromaDB's default embedding function (all-MiniLM-L6-v2)
-            return chromadb.utils.embedding_functions.DefaultEmbeddingFunction()
+            # Use a sentence-transformers embedding function compatible with Chroma's default.
+            return HuggingFaceEmbeddingFunction(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                embedding_config=self.embedding_config,
+                name_override="default",
+            )
 
     def add_documents(self,
                      documents: list[str],
@@ -329,6 +560,8 @@ class ChromaClient:
             if isinstance(ef, GeminiEmbeddingFunction):
                 return f"gemini ({ef.model_name})"
             if isinstance(ef, HuggingFaceEmbeddingFunction):
+                if getattr(ef, "name_override", None) == "default":
+                    return "default (all-MiniLM-L6-v2)"
                 return f"huggingface ({ef.model_name})"
         except Exception:
             pass

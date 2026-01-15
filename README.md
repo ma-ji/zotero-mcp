@@ -254,6 +254,18 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `GEMINI_BASE_URL`: Custom Gemini endpoint URL (optional, for use with compatible APIs)
 - `ZOTERO_DB_PATH`: Custom `zotero.sqlite` path (optional)
 
+**Performance / Parallelism (advanced):**
+- `ZOTERO_FULLTEXT_WORKERS`: Worker processes for `update-db --fulltext` extraction (higher = faster, but higher RAM/GPU usage)
+- `ZOTERO_DOCLING_DEVICE`: Docling device (`auto`, `cpu`, `cuda`, `mps`)
+- `ZOTERO_DOCLING_NUM_THREADS`: Docling threads per worker process
+- `ZOTERO_DOCLING_GPU_IDS`: Comma-separated GPU ids for Docling extraction workers (e.g. `0,1`)
+- `ZOTERO_EMBEDDING_DEVICE`: Local embedding device (e.g. `cpu`, `cuda`, `cuda:0`)
+- `ZOTERO_EMBEDDING_BATCH_SIZE`: Local embedding batch size (lower helps avoid OOM)
+- `ZOTERO_EMBEDDING_CHUNK_SIZE`: Local embedding chunk size (multi-process)
+- `ZOTERO_EMBEDDING_MULTI_PROCESS`: Enable multi-process embedding (`true/false`); uses multiple GPUs when available
+- `ZOTERO_EMBEDDING_DEVICES`: Comma-separated embedding devices (e.g. `cuda:0,cuda:1`)
+- `ZOTERO_EMBEDDING_GPU_IDS`: Comma-separated GPU ids for embedding (e.g. `0,1`)
+
 ### Command-Line Options
 
 ```bash
@@ -279,6 +291,8 @@ zotero-mcp update-db --fulltext             # Update with full-text extraction (
 zotero-mcp update-db --force-rebuild       # Force complete database rebuild
 zotero-mcp update-db --fulltext --force-rebuild  # Rebuild with full-text extraction
 zotero-mcp update-db --fulltext --db-path "your_path_to/zotero.sqlite" # Customize your zotero database path
+zotero-mcp update-db --fulltext --fulltext-workers 4 --docling-gpu-ids "0,1"  # Parallel fulltext extraction across GPUs
+zotero-mcp update-db --embedding-multi-process --embedding-devices "cuda:0,cuda:1"  # Multi-GPU local embeddings
 zotero-mcp db-status                       # Show database status and info
 
 # General

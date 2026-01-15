@@ -74,7 +74,14 @@ class LocalZoteroReader:
     without going through the Zotero API.
     """
 
-    def __init__(self, db_path: str | None = None, pdf_max_pages: int | None = None):
+    def __init__(
+        self,
+        db_path: str | None = None,
+        pdf_max_pages: int | None = None,
+        *,
+        docling_device: str | None = None,
+        docling_num_threads: int | None = None,
+    ):
         """
         Initialize the local database reader.
 
@@ -84,6 +91,44 @@ class LocalZoteroReader:
         self.db_path = db_path or self._find_zotero_db()
         self._connection: sqlite3.Connection | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
+        self.docling_device = docling_device
+        self.docling_num_threads = docling_num_threads
+
+    def _get_docling_device(self):
+        """Return Docling AcceleratorDevice based on config/env."""
+        device_raw = (
+            self.docling_device
+            or os.getenv("ZOTERO_DOCLING_DEVICE")
+            or "auto"
+        ).strip().lower()
+
+        try:
+            from docling.datamodel.pipeline_options import AcceleratorDevice  # type: ignore
+        except ImportError:  # pragma: no cover - import paths differ between docling versions
+            from docling.datamodel.accelerator_options import AcceleratorDevice  # type: ignore
+
+        if device_raw in {"cpu"}:
+            return AcceleratorDevice.CPU
+        if device_raw in {"cuda", "gpu"}:
+            return AcceleratorDevice.CUDA
+        if device_raw in {"mps"}:
+            return AcceleratorDevice.MPS
+        return AcceleratorDevice.AUTO
+
+    def _get_docling_num_threads(self) -> int:
+        """Return Docling thread count based on config/env."""
+        if isinstance(self.docling_num_threads, int) and self.docling_num_threads > 0:
+            return self.docling_num_threads
+
+        raw = os.getenv("ZOTERO_DOCLING_NUM_THREADS")
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
+        return 4
 
     def _find_zotero_db(self) -> str:
         """
@@ -164,24 +209,45 @@ class LocalZoteroReader:
 
     def _extract_text_from_pdf(self, file_path: Path) -> str:
         """Extract text from a PDF using Docling with a page cap to avoid stalls."""
-        try:
-            from .converter import convert_file_to_markdown
+        from .converter import convert_file_to_markdown
 
-            # Determine page cap: config value > env > default (10)
-            if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
-                maxpages = self.pdf_max_pages
-            else:
-                max_pages_env = os.getenv("ZOTERO_PDF_MAXPAGES")
-                try:
-                    maxpages = int(max_pages_env) if max_pages_env else 10
-                except ValueError:
-                    maxpages = 10
+        # Determine page cap: config value > env > default (10)
+        if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
+            maxpages = self.pdf_max_pages
+        else:
+            max_pages_env = os.getenv("ZOTERO_PDF_MAXPAGES")
+            try:
+                maxpages = int(max_pages_env) if max_pages_env else 10
+            except ValueError:
+                maxpages = 10
+
+        device = self._get_docling_device()
+        num_threads = self._get_docling_num_threads()
+
+        # Prefer configured device; fall back to CPU on GPU/memory failures.
+        try:
             return convert_file_to_markdown(
                 file_path,
                 max_num_pages=maxpages,
                 image_processing="drop",
+                device=device,
+                num_threads=num_threads,
             )
-        except Exception:
+        except Exception as e:
+            try:
+                # Retry on CPU if non-CPU device fails (common with GPU OOM).
+                if getattr(device, "value", str(device)) != "cpu":
+                    cpu_device = type(device).CPU
+                    return convert_file_to_markdown(
+                        file_path,
+                        max_num_pages=maxpages,
+                        image_processing="drop",
+                        device=cpu_device,
+                        num_threads=num_threads,
+                    )
+            except Exception:
+                pass
+            logger.debug("PDF extraction failed for %s: %s", file_path, e, exc_info=True)
             return ""
 
     def _extract_text_from_html(self, file_path: Path) -> str:
@@ -212,10 +278,13 @@ class LocalZoteroReader:
         # Try Docling for other common non-plain-text formats
         try:
             from .converter import convert_file_to_markdown
-
+            device = self._get_docling_device()
+            num_threads = self._get_docling_num_threads()
             return convert_file_to_markdown(
                 file_path,
                 image_processing="drop",
+                device=device,
+                num_threads=num_threads,
             )
         except Exception:
             pass
