@@ -322,7 +322,7 @@ def get_attachment_details(
 
 def convert_to_markdown(file_path: str | Path) -> str:
     """
-    Convert a file to markdown using markitdown library.
+    Convert a file to markdown using Docling (fallback to MarkItDown).
 
     Args:
         file_path: Path to the file to convert.
@@ -331,8 +331,16 @@ def convert_to_markdown(file_path: str | Path) -> str:
         Markdown text.
     """
     try:
-        md = MarkItDown()
-        result = md.convert(str(file_path))
-        return result.text_content
-    except Exception as e:
-        return f"Error converting file to markdown: {str(e)}"
+        from zotero_mcp.converter import convert_file_to_markdown
+
+        return convert_file_to_markdown(file_path, image_processing="placeholder")
+    except Exception as docling_error:
+        try:
+            md = MarkItDown()
+            result = md.convert(str(file_path))
+            return result.text_content
+        except Exception as markitdown_error:
+            return (
+                "Error converting file to markdown: "
+                f"docling={docling_error}; markitdown={markitdown_error}"
+            )

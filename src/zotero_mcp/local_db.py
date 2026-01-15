@@ -84,11 +84,6 @@ class LocalZoteroReader:
         self.db_path = db_path or self._find_zotero_db()
         self._connection: sqlite3.Connection | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
-        # Reduce noise from pdfminer warnings
-        try:
-            logging.getLogger("pdfminer").setLevel(logging.ERROR)
-        except Exception:
-            pass
 
     def _find_zotero_db(self) -> str:
         """
@@ -168,9 +163,10 @@ class LocalZoteroReader:
         return None
 
     def _extract_text_from_pdf(self, file_path: Path) -> str:
-        """Extract text from a PDF using pdfminer with a page cap to avoid stalls."""
+        """Extract text from a PDF using Docling with a page cap to avoid stalls."""
         try:
-            from pdfminer.high_level import extract_text  # type: ignore
+            from .converter import convert_file_to_markdown
+
             # Determine page cap: config value > env > default (10)
             if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
                 maxpages = self.pdf_max_pages
@@ -180,8 +176,11 @@ class LocalZoteroReader:
                     maxpages = int(max_pages_env) if max_pages_env else 10
                 except ValueError:
                     maxpages = 10
-            text = extract_text(str(file_path), maxpages=maxpages)
-            return text or ""
+            return convert_file_to_markdown(
+                file_path,
+                max_num_pages=maxpages,
+                image_processing="drop",
+            )
         except Exception:
             return ""
 
@@ -210,6 +209,16 @@ class LocalZoteroReader:
             return self._extract_text_from_pdf(file_path)
         if suffix in {".html", ".htm"}:
             return self._extract_text_from_html(file_path)
+        # Try Docling for other common non-plain-text formats
+        try:
+            from .converter import convert_file_to_markdown
+
+            return convert_file_to_markdown(
+                file_path,
+                image_processing="drop",
+            )
+        except Exception:
+            pass
         # Generic best-effort
         try:
             return file_path.read_text(errors="ignore")
@@ -226,28 +235,50 @@ class LocalZoteroReader:
     def _extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         """Attempt to extract fulltext and source from the item's best attachment.
 
-        Preference: use PDF when available; fall back to HTML when no PDF exists.
-        Returns (text, source) where source is 'pdf' or 'html'.
+        Preference: use PDF when available; fall back to HTML, then other formats.
+        Returns (text, source) where source is derived from the chosen attachment.
         """
-        best_pdf = None
-        best_html = None
+        best_pdf: tuple[Path, int] | None = None
+        best_html: tuple[Path, int] | None = None
+        best_other: tuple[Path, int] | None = None
+
         for key, path, ctype in self._iter_parent_attachments(item_id):
             resolved = self._resolve_attachment_path(key, path or "")
             if not resolved or not resolved.exists():
                 continue
-            if ctype == "application/pdf" and best_pdf is None:
-                best_pdf = resolved
-            elif (ctype or "").startswith("text/html") and best_html is None:
-                best_html = resolved
-        # Prefer PDF, otherwise fall back to HTML
-        target = best_pdf or best_html
+            try:
+                size = resolved.stat().st_size
+            except OSError:
+                size = 0
+
+            if ctype == "application/pdf":
+                if best_pdf is None or size > best_pdf[1]:
+                    best_pdf = (resolved, size)
+            elif (ctype or "").startswith("text/html"):
+                if best_html is None or size > best_html[1]:
+                    best_html = (resolved, size)
+            else:
+                if best_other is None or size > best_other[1]:
+                    best_other = (resolved, size)
+
+        target = (
+            (best_pdf[0] if best_pdf else None)
+            or (best_html[0] if best_html else None)
+            or (best_other[0] if best_other else None)
+        )
         if not target:
             return None
         text = self._extract_text_from_file(target)
         if not text:
             return None
         # Truncate to keep embeddings reasonable
-        source = "pdf" if target.suffix.lower() == ".pdf" else ("html" if target.suffix.lower() in {".html", ".htm"} else "file")
+        suffix = target.suffix.lower()
+        if suffix == ".pdf":
+            source = "pdf"
+        elif suffix in {".html", ".htm"}:
+            source = "html"
+        else:
+            source = suffix.lstrip(".") or "file"
         return (text[:10000], source)
 
     def close(self):
