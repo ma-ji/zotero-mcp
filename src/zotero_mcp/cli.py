@@ -334,7 +334,8 @@ def main():
                 print(f"  Config path: {config_path}")
                 print(f"  Collection: {collection_info.get('name', 'Unknown')}")
                 print(f"  Document count: {collection_info.get('count', 0)}")
-                print(f"  Embedding model: {collection_info.get('embedding_model', 'Unknown')}")
+                embedding_desc = collection_info.get("embedding_description") or collection_info.get("embedding_model", "Unknown")
+                print(f"  Embedding model: {embedding_desc}")
                 print(f"  Database path: {collection_info.get('persist_directory', 'Unknown')}")
 
                 update_config = status.get("update_config", {})
@@ -385,6 +386,7 @@ def main():
             # Create semantic search instance with optional db_path override
             search = create_semantic_search(str(config_path), db_path=db_path)
 
+            print(f"Embedding model: {search.chroma_client.get_embedding_description()}")
             print("Starting database update...")
             if args.fulltext:
                 print("Note: --fulltext flag enabled. Will extract content from local database if available.")
@@ -436,7 +438,8 @@ def main():
             collection_info = status.get("collection_info", {})
             print(f"Collection: {collection_info.get('name', 'Unknown')}")
             print(f"Document count: {collection_info.get('count', 0)}")
-            print(f"Embedding model: {collection_info.get('embedding_model', 'Unknown')}")
+            embedding_desc = collection_info.get("embedding_description") or collection_info.get("embedding_model", "Unknown")
+            print(f"Embedding model: {embedding_desc}")
             print(f"Database path: {collection_info.get('persist_directory', 'Unknown')}")
 
             update_config = status.get("update_config", {})

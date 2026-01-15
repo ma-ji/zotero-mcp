@@ -118,6 +118,25 @@ def find_claude_config():
     print(f"Claude Desktop config not found. Using default path: {default_path}")
     return default_path
 
+
+def _embedding_model_name_for_display(embedding_model: str, embedding_config: dict) -> str:
+    """Return a user-friendly embedding model name for display purposes."""
+    embedding_config = embedding_config or {}
+
+    if embedding_model == "default":
+        return "all-MiniLM-L6-v2"
+    if embedding_model == "openai":
+        return embedding_config.get("model_name") or "text-embedding-3-small"
+    if embedding_model == "gemini":
+        return embedding_config.get("model_name") or "models/text-embedding-004"
+    if embedding_model == "qwen":
+        return embedding_config.get("model_name") or "Qwen/Qwen3-Embedding-0.6B"
+    if embedding_model == "embeddinggemma":
+        return embedding_config.get("model_name") or "google/embeddinggemma-300m"
+    # Any other string is treated as a HuggingFace model id
+    return embedding_model
+
+
 def setup_semantic_search(existing_semantic_config: dict = None, semantic_config_only_arg: bool = False) -> dict:
     """Interactive setup for semantic search configuration."""
     print("\n=== Semantic Search Configuration ===")
@@ -125,7 +144,8 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
     if existing_semantic_config:
         # Display config without sensitive info
         model = existing_semantic_config.get("embedding_model", "unknown")
-        name = existing_semantic_config.get("embedding_config", {}).get("model_name", "unknown")
+        embedding_config = existing_semantic_config.get("embedding_config", {}) or {}
+        name = _embedding_model_name_for_display(model, embedding_config)
         update_freq = existing_semantic_config.get("update_config", {}).get("update_frequency", "unknown")
         db_path = existing_semantic_config.get("zotero_db_path", "auto-detect")
         print("Found existing semantic search configuration:")
@@ -146,12 +166,13 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
     print("1. Default (all-MiniLM-L6-v2) - Free, runs locally")
     print("2. OpenAI - Better quality, requires API key")
     print("3. Gemini - Better quality, requires API key")
+    print("4. HuggingFace - Use any sentence-transformers model (runs locally, downloads on first use)")
 
     while True:
-        choice = input("\nChoose embedding model (1-3): ").strip()
-        if choice in ["1", "2", "3"]:
+        choice = input("\nChoose embedding model (1-4): ").strip()
+        if choice in ["1", "2", "3", "4"]:
             break
-        print("Please enter 1, 2, or 3")
+        print("Please enter 1, 2, 3, or 4")
 
     config = {}
 
@@ -226,6 +247,31 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
             print(f"Using custom Gemini base URL: {base_url}")
         else:
             print("Using default Gemini base URL")
+
+    elif choice == "4":
+        # HuggingFace model (SentenceTransformers)
+        default_hf_model = "sentence-transformers/all-MiniLM-L6-v2"
+        if existing_semantic_config:
+            existing_model = existing_semantic_config.get("embedding_model", "")
+            if existing_model and existing_model not in ("default", "openai", "gemini"):
+                default_hf_model = existing_model
+
+        print("\nHuggingFace embedding model")
+        print("Enter any sentence-transformers compatible model id from HuggingFace Hub.")
+        print("Examples:")
+        print("  - sentence-transformers/all-MiniLM-L6-v2")
+        print("  - BAAI/bge-small-en-v1.5")
+        print("  - intfloat/e5-base-v2")
+
+        while True:
+            raw_model = input(f"Model name [{default_hf_model}]: ").strip()
+            hf_model = raw_model or default_hf_model
+            if hf_model:
+                break
+            print("Please enter a valid HuggingFace model name.")
+
+        config["embedding_model"] = hf_model
+        print(f"Using HuggingFace embedding model: {hf_model}")
 
     # Configure update frequency
     print("\n=== Database Update Configuration ===")

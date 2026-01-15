@@ -21,7 +21,7 @@
 
 ### 🧠 AI-Powered Semantic Search
 - **Vector-based similarity search** over your entire research library
-- **Multiple embedding models**: Default (free), OpenAI, and Gemini options
+- **Multiple embedding models**: Default (local), OpenAI, Gemini, or any HuggingFace sentence-transformers model
 - **Intelligent results** with similarity scores and contextual matching
 - **Auto-updating database** with configurable sync schedules
 
@@ -109,6 +109,7 @@ zotero-mcp setup --semantic-config-only
 - **Default (all-MiniLM-L6-v2)**: Free, runs locally, good for most use cases
 - **OpenAI**: Better quality, requires API key (`text-embedding-3-small` or `text-embedding-3-large`)
 - **Gemini**: Better quality, requires API key (`models/text-embedding-004` or experimental models)
+- **HuggingFace**: Use any sentence-transformers model id (runs locally; downloads model on first use)
 
 **Update Frequency Options:**
 - **Manual**: Update only when you run `zotero-mcp update-db`
@@ -244,7 +245,7 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
 
 **Semantic Search:**
-- `ZOTERO_EMBEDDING_MODEL`: Embedding model to use (default, openai, gemini)
+- `ZOTERO_EMBEDDING_MODEL`: Embedding model to use (`default`, `openai`, `gemini`, or any HuggingFace model id like `BAAI/bge-small-en-v1.5`)
 - `OPENAI_API_KEY`: Your OpenAI API key (for OpenAI embeddings)
 - `OPENAI_EMBEDDING_MODEL`: OpenAI model name (text-embedding-3-small, text-embedding-3-large)
 - `OPENAI_BASE_URL`: Custom OpenAI endpoint URL (optional, for use with compatible APIs)

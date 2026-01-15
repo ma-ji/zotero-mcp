@@ -42,6 +42,7 @@ async def server_lifespan(server: FastMCP):
 
             if search.should_update_database():
                 sys.stderr.write("Auto-updating semantic search database...\n")
+                sys.stderr.write(f"Embedding model: {search.chroma_client.get_embedding_description()}\n")
 
                 # Run update in background to avoid blocking server startup
                 async def background_update():
@@ -1869,6 +1870,7 @@ def update_search_database(
 
         # Create semantic search instance
         search = create_semantic_search(str(config_path))
+        embedding_desc = search.chroma_client.get_embedding_description()
 
         # Perform update with no fulltext extraction (for speed)
         stats = search.update_database(
@@ -1879,6 +1881,8 @@ def update_search_database(
 
         # Format results
         output = ["# Database Update Results", ""]
+        output.append(f"**Embedding Model:** {embedding_desc}")
+        output.append("")
 
         if stats.get("error"):
             output.append(f"**Error:** {stats['error']}")
@@ -1940,7 +1944,8 @@ def get_search_database_status(*, ctx: Context) -> str:
         output.append("## Collection Information")
         output.append(f"**Name:** {collection_info.get('name', 'Unknown')}")
         output.append(f"**Document Count:** {collection_info.get('count', 0)}")
-        output.append(f"**Embedding Model:** {collection_info.get('embedding_model', 'Unknown')}")
+        embedding_desc = collection_info.get("embedding_description") or collection_info.get("embedding_model", "Unknown")
+        output.append(f"**Embedding Model:** {embedding_desc}")
         output.append(f"**Database Path:** {collection_info.get('persist_directory', 'Unknown')}")
 
         if collection_info.get('error'):

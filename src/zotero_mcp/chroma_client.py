@@ -316,6 +316,40 @@ class ChromaClient:
             logger.error(f"Error deleting documents from ChromaDB: {e}")
             raise
 
+    def get_embedding_description(self) -> str:
+        """Return a human-friendly description of the active embedding model."""
+        collection = getattr(self, "collection", None)
+        ef = getattr(collection, "_embedding_function", None) or getattr(self, "embedding_function", None)
+        if ef is None:
+            return "unknown"
+
+        try:
+            if isinstance(ef, OpenAIEmbeddingFunction):
+                return f"openai ({ef.model_name})"
+            if isinstance(ef, GeminiEmbeddingFunction):
+                return f"gemini ({ef.model_name})"
+            if isinstance(ef, HuggingFaceEmbeddingFunction):
+                return f"huggingface ({ef.model_name})"
+        except Exception:
+            pass
+
+        try:
+            ef_name = ef.name() if hasattr(ef, "name") else None
+        except Exception:
+            ef_name = None
+
+        if ef_name == "default":
+            return "default (all-MiniLM-L6-v2)"
+
+        model_name = getattr(ef, "model_name", None)
+        if ef_name and model_name:
+            return f"{ef_name} ({model_name})"
+        if ef_name:
+            return str(ef_name)
+        if model_name:
+            return f"{type(ef).__name__} ({model_name})"
+        return type(ef).__name__
+
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
         try:
@@ -324,6 +358,7 @@ class ChromaClient:
                 "name": self.collection_name,
                 "count": count,
                 "embedding_model": self.embedding_model,
+                "embedding_description": self.get_embedding_description(),
                 "persist_directory": self.persist_directory
             }
         except Exception as e:
@@ -332,6 +367,7 @@ class ChromaClient:
                 "name": self.collection_name,
                 "count": 0,
                 "embedding_model": self.embedding_model,
+                "embedding_description": self.get_embedding_description(),
                 "persist_directory": self.persist_directory,
                 "error": str(e)
             }
