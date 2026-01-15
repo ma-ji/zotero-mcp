@@ -1,3 +1,3 @@
 """Version information."""
 
-__version__ = "0.1.2-mj-patch[20260115]"
+__version__ = "0.1.3"
