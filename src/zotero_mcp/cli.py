@@ -431,6 +431,9 @@ def main():
             search = create_semantic_search(str(config_path), db_path=db_path)
 
             print(f"Embedding model: {search.chroma_client.get_embedding_description()}")
+            print(
+                f"Embedding device: {search.chroma_client.get_embedding_device_description(ensure_pool=True, mark_reported=True)}"
+            )
             print("Starting database update...")
             if args.fulltext:
                 print("Note: --fulltext flag enabled. Will extract content from local database if available.")
