@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -598,6 +599,351 @@ class ZoteroSemanticSearch:
             logger.info("Falling back to API...")
             return self._get_items_from_api(limit)
 
+    def _update_database_local_fulltext_pipelined(
+        self,
+        *,
+        stats: dict[str, Any],
+        limit: int | None,
+        force_rebuild: bool,
+    ) -> None:
+        """Update database by piping local fulltext extraction into embedding/upsert."""
+        from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+        import multiprocessing as mp
+
+        from .fulltext_worker import extract_fulltext_for_item, init_fulltext_worker
+
+        # Load per-run config, including extraction limits and db path if provided.
+        pdf_max_pages = None
+        extraction_workers: int | None = None
+        docling_device: str | None = None
+        docling_num_threads: int | None = None
+        docling_gpu_ids: list[str] | None = None
+        zotero_db_path = self.db_path  # CLI override takes precedence
+
+        # If semantic_search config file exists, prefer its setting.
+        try:
+            if self.config_path and os.path.exists(self.config_path):
+                with open(self.config_path) as _f:
+                    _cfg = json.load(_f)
+                    semantic_cfg = _cfg.get("semantic_search", {})
+                    extraction_cfg = semantic_cfg.get("extraction", {}) or {}
+                    pdf_max_pages = extraction_cfg.get("pdf_max_pages")
+                    extraction_workers = extraction_cfg.get("workers")
+                    docling_device = extraction_cfg.get("docling_device")
+                    docling_num_threads = extraction_cfg.get("docling_num_threads")
+                    docling_gpu_ids = extraction_cfg.get("gpu_ids")
+                    if not zotero_db_path:
+                        zotero_db_path = semantic_cfg.get("zotero_db_path")
+        except Exception:
+            pass
+
+        # Allow env overrides for parallel extraction (env > config).
+        raw = os.getenv("ZOTERO_FULLTEXT_WORKERS")
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    extraction_workers = value
+            except ValueError:
+                pass
+
+        raw = os.getenv("ZOTERO_DOCLING_DEVICE")
+        if raw and raw.strip():
+            docling_device = raw.strip()
+
+        raw = os.getenv("ZOTERO_DOCLING_NUM_THREADS")
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    docling_num_threads = value
+            except ValueError:
+                pass
+
+        raw = os.getenv("ZOTERO_DOCLING_GPU_IDS")
+        if raw:
+            docling_gpu_ids = [p.strip() for p in raw.split(",") if p.strip()]
+        elif isinstance(docling_gpu_ids, str):
+            docling_gpu_ids = [p.strip() for p in docling_gpu_ids.split(",") if p.strip()]
+        elif isinstance(docling_gpu_ids, list):
+            docling_gpu_ids = [str(p).strip() for p in docling_gpu_ids if str(p).strip()]
+        else:
+            docling_gpu_ids = None
+
+        # Determine extraction worker count.
+        effective_workers = extraction_workers or 1
+        if effective_workers < 1:
+            effective_workers = 1
+
+        # Helper to build API-compatible item structure for embedding.
+        def _to_api_item(item) -> dict[str, Any]:
+            api_item = {
+                "key": item.key,
+                "version": 0,
+                "data": {
+                    "key": item.key,
+                    "itemType": getattr(item, "item_type", None) or "journalArticle",
+                    "title": item.title or "",
+                    "abstractNote": item.abstract or "",
+                    "extra": item.extra or "",
+                    "fulltext": getattr(item, "fulltext", None) or "",
+                    "fulltextSource": getattr(item, "fulltext_source", None) or "",
+                    "dateAdded": item.date_added,
+                    "dateModified": item.date_modified,
+                    "creators": self._parse_creators_string(item.creators) if item.creators else [],
+                },
+            }
+            if item.notes:
+                api_item["data"]["notes"] = item.notes
+            return api_item
+
+        # Report progress periodically to keep long runs transparent.
+        extracted = 0
+        total_to_extract = 0
+        skipped_existing = 0
+        updated_existing = 0
+        progress_stop = threading.Event()
+
+        def _write_progress() -> None:
+            try:
+                sys.stderr.write(
+                    "Progress: "
+                    f"extracted {extracted}/{total_to_extract} "
+                    f"embedded {stats.get('added_items', 0)}/{total_to_extract} "
+                    f"(skipped {skipped_existing} existing, updating {updated_existing}, errors {stats.get('errors', 0)})\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+        def _progress_reporter() -> None:
+            while not progress_stop.wait(10.0):
+                _write_progress()
+
+        # Main workflow: read metadata, decide which items to process, then pipeline extraction -> embed/upsert.
+        with suppress_stdout(), LocalZoteroReader(
+            db_path=zotero_db_path,
+            pdf_max_pages=pdf_max_pages,
+            docling_device=docling_device,
+            docling_num_threads=docling_num_threads,
+        ) as reader:
+            sys.stderr.write("Scanning local Zotero database for items...\n")
+            local_items = reader.get_items_with_text(limit=limit, include_fulltext=False)
+            candidate_count = len(local_items)
+            sys.stderr.write(f"Found {candidate_count} candidate items.\n")
+
+            # Optional deduplication: if preprint and journalArticle share a DOI/title, keep journalArticle.
+            def norm(s: str | None) -> str | None:
+                if not s:
+                    return None
+                return "".join(s.lower().split())
+
+            key_to_best = {}
+            for it in local_items:
+                doi_key = ("doi", norm(getattr(it, "doi", None))) if getattr(it, "doi", None) else None
+                title_key = ("title", norm(getattr(it, "title", None))) if getattr(it, "title", None) else None
+
+                def consider(k):
+                    if not k:
+                        return
+                    cur = key_to_best.get(k)
+                    if cur is None:
+                        key_to_best[k] = it
+                    else:
+                        prefer_types = {"journalArticle": 2, "preprint": 1}
+                        cur_score = prefer_types.get(getattr(cur, "item_type", ""), 0)
+                        new_score = prefer_types.get(getattr(it, "item_type", ""), 0)
+                        if new_score > cur_score:
+                            key_to_best[k] = it
+
+                consider(doi_key)
+                consider(title_key)
+
+            filtered_items = []
+            for it in local_items:
+                if getattr(it, "item_type", None) == "preprint":
+                    k_doi = ("doi", norm(getattr(it, "doi", None))) if getattr(it, "doi", None) else None
+                    k_title = ("title", norm(getattr(it, "title", None))) if getattr(it, "title", None) else None
+                    drop = False
+                    for k in (k_doi, k_title):
+                        if not k:
+                            continue
+                        best = key_to_best.get(k)
+                        if best is not None and best is not it and getattr(best, "item_type", None) == "journalArticle":
+                            drop = True
+                            break
+                    if drop:
+                        continue
+                filtered_items.append(it)
+
+            local_items = filtered_items
+
+            # Decide which items need extraction/embedding work.
+            chroma_client = None if force_rebuild else self.chroma_client
+            items_to_process = []
+            for it in local_items:
+                should_process = True
+                if chroma_client and not force_rebuild:
+                    existing_metadata = chroma_client.get_document_metadata(it.key)
+                    if existing_metadata:
+                        chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
+                        local_has_fulltext = len(reader.get_fulltext_meta_for_item(it.item_id)) > 0
+                        if not chroma_has_fulltext and local_has_fulltext:
+                            updated_existing += 1
+                        else:
+                            should_process = False
+                            skipped_existing += 1
+                if should_process:
+                    items_to_process.append(it)
+
+            total_to_extract = len(items_to_process)
+            stats["total_items"] = total_to_extract
+            stats["skipped_items"] += skipped_existing
+            stats["updated_items"] += updated_existing
+
+            if total_to_extract != candidate_count:
+                sys.stderr.write(
+                    f"After filtering/dedup: {len(local_items)} items; {total_to_extract} to (re)index.\n"
+                )
+            else:
+                sys.stderr.write(f"Items to (re)index: {total_to_extract}\n")
+            sys.stderr.write("Pipelining fulltext extraction -> embedding/indexing...\n")
+            try:
+                sys.stderr.write(f"Total items to index: {stats['total_items']}\n")
+            except Exception:
+                pass
+
+            if total_to_extract == 0:
+                return
+
+            # Resolve GPU ids for extraction worker pinning if not explicitly configured.
+            gpu_ids = docling_gpu_ids
+            if gpu_ids is None and (docling_device or "auto").strip().lower() != "cpu":
+                raw_visible = os.getenv("CUDA_VISIBLE_DEVICES")
+                if raw_visible:
+                    parts = [p.strip() for p in raw_visible.split(",") if p.strip()]
+                    if parts:
+                        gpu_ids = parts
+                if gpu_ids is None:
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            count = torch.cuda.device_count()
+                            if count > 0:
+                                gpu_ids = [str(i) for i in range(count)]
+                    except Exception:
+                        pass
+
+            if gpu_ids and effective_workers > len(gpu_ids):
+                try:
+                    sys.stderr.write(
+                        f"Warning: {effective_workers} extraction workers over {len(gpu_ids)} GPUs may OOM; consider lowering workers or batch sizes.\n"
+                    )
+                except Exception:
+                    pass
+
+            reporter_thread = threading.Thread(target=_progress_reporter, daemon=True)
+            reporter_thread.start()
+
+            try:
+                embed_batch: list[dict[str, Any]] = []
+                embed_batch_size = 50
+                flush_interval_s = 5.0
+                last_flush = time.monotonic()
+
+                def _flush_embed_batch() -> None:
+                    nonlocal last_flush
+                    if not embed_batch:
+                        return
+                    batch_stats = self._process_item_batch(embed_batch, force_rebuild)
+                    stats["processed_items"] += batch_stats["processed"]
+                    stats["added_items"] += batch_stats["added"]
+                    stats["updated_items"] += batch_stats["updated"]
+                    stats["skipped_items"] += batch_stats["skipped"]
+                    stats["errors"] += batch_stats["errors"]
+                    embed_batch.clear()
+                    last_flush = time.monotonic()
+
+                if effective_workers == 1 or total_to_extract == 1:
+                    for it in items_to_process:
+                        try:
+                            text = reader.extract_fulltext_for_item(it.item_id)
+                            if text:
+                                if isinstance(text, tuple) and len(text) == 2:
+                                    it.fulltext, it.fulltext_source = text[0], text[1]
+                                else:
+                                    it.fulltext = str(text)
+                        except Exception:
+                            pass
+
+                        extracted += 1
+                        embed_batch.append(_to_api_item(it))
+
+                        now = time.monotonic()
+                        if len(embed_batch) >= embed_batch_size or (now - last_flush) >= flush_interval_s:
+                            _flush_embed_batch()
+                else:
+                    ctx = mp.get_context("spawn")
+                    max_in_flight = max(effective_workers * 4, embed_batch_size)
+                    it_iter = iter(items_to_process)
+
+                    with ProcessPoolExecutor(
+                        max_workers=effective_workers,
+                        mp_context=ctx,
+                        initializer=init_fulltext_worker,
+                        initargs=(
+                            zotero_db_path,
+                            pdf_max_pages,
+                            docling_device,
+                            docling_num_threads,
+                            gpu_ids,
+                        ),
+                    ) as executor:
+                        in_flight: dict[Any, Any] = {}
+
+                        def _submit_more() -> None:
+                            while len(in_flight) < max_in_flight:
+                                try:
+                                    nxt = next(it_iter)
+                                except StopIteration:
+                                    break
+                                fut = executor.submit(extract_fulltext_for_item, nxt.item_id)
+                                in_flight[fut] = nxt
+
+                        _submit_more()
+
+                        while in_flight:
+                            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                            for fut in done:
+                                it = in_flight.pop(fut)
+                                try:
+                                    _, text, source = fut.result()
+                                    if text:
+                                        it.fulltext = text
+                                        it.fulltext_source = source
+                                except Exception:
+                                    pass
+
+                                extracted += 1
+                                embed_batch.append(_to_api_item(it))
+
+                                now = time.monotonic()
+                                if len(embed_batch) >= embed_batch_size or (now - last_flush) >= flush_interval_s:
+                                    _flush_embed_batch()
+
+                            _submit_more()
+
+                _flush_embed_batch()
+
+            finally:
+                progress_stop.set()
+                try:
+                    reporter_thread.join(timeout=1.0)
+                except Exception:
+                    pass
+                _write_progress()
+
     def _parse_creators_string(self, creators_str: str) -> list[dict[str, str]]:
         """
         Parse creators string from local DB into API format.
@@ -723,50 +1069,58 @@ class ZoteroSemanticSearch:
                 logger.info("Force rebuilding database...")
                 self.chroma_client.reset_collection()
 
-            # Get all items from either local DB or API
-            all_items = self._get_items_from_source(
-                limit=limit,
-                extract_fulltext=extract_fulltext,
-                chroma_client=self.chroma_client if not force_full_rebuild else None,
-                force_rebuild=force_full_rebuild
-            )
+            if extract_fulltext and is_local_mode():
+                # Local mode: pipeline extraction and embedding so GPUs/CPU can overlap.
+                self._update_database_local_fulltext_pipelined(
+                    stats=stats,
+                    limit=limit,
+                    force_rebuild=force_full_rebuild,
+                )
+            else:
+                # Get all items from either local DB or API
+                all_items = self._get_items_from_source(
+                    limit=limit,
+                    extract_fulltext=extract_fulltext,
+                    chroma_client=self.chroma_client if not force_full_rebuild else None,
+                    force_rebuild=force_full_rebuild
+                )
 
-            stats["total_items"] = len(all_items)
-            logger.info(f"Found {stats['total_items']} items to process")
-            # Immediate progress line so users see counts up-front
-            try:
-                sys.stderr.write(f"Total items to index: {stats['total_items']}\n")
-            except Exception:
-                pass
-
-            # Process items in batches
-            batch_size = 50
-            # Track next milestone for progress printing (every 10 items)
-            next_milestone = 10 if stats["total_items"] >= 10 else stats["total_items"]
-            # Count of items seen (including skipped), used for progress milestones
-            seen_items = 0
-            for i in range(0, len(all_items), batch_size):
-                batch = all_items[i:i + batch_size]
-                batch_stats = self._process_item_batch(batch, force_full_rebuild)
-
-                stats["processed_items"] += batch_stats["processed"]
-                stats["added_items"] += batch_stats["added"]
-                stats["updated_items"] += batch_stats["updated"]
-                stats["skipped_items"] += batch_stats["skipped"]
-                stats["errors"] += batch_stats["errors"]
-                seen_items += len(batch)
-
-                logger.info(f"Processed {seen_items}/{stats['total_items']} items (added: {stats['added_items']}, skipped: {stats['skipped_items']})")
-                # Print progress every 10 seen items (even if all are skipped)
+                stats["total_items"] = len(all_items)
+                logger.info(f"Found {stats['total_items']} items to process")
+                # Immediate progress line so users see counts up-front
                 try:
-                    while seen_items >= next_milestone and next_milestone > 0:
-                        sys.stderr.write(f"Processed: {next_milestone}/{stats['total_items']} added:{stats['added_items']} skipped:{stats['skipped_items']} errors:{stats['errors']}\n")
-                        next_milestone += 10
-                        if next_milestone > stats["total_items"]:
-                            next_milestone = stats["total_items"]
-                            break
+                    sys.stderr.write(f"Total items to index: {stats['total_items']}\n")
                 except Exception:
                     pass
+
+                # Process items in batches
+                batch_size = 50
+                # Track next milestone for progress printing (every 10 items)
+                next_milestone = 10 if stats["total_items"] >= 10 else stats["total_items"]
+                # Count of items seen (including skipped), used for progress milestones
+                seen_items = 0
+                for i in range(0, len(all_items), batch_size):
+                    batch = all_items[i:i + batch_size]
+                    batch_stats = self._process_item_batch(batch, force_full_rebuild)
+
+                    stats["processed_items"] += batch_stats["processed"]
+                    stats["added_items"] += batch_stats["added"]
+                    stats["updated_items"] += batch_stats["updated"]
+                    stats["skipped_items"] += batch_stats["skipped"]
+                    stats["errors"] += batch_stats["errors"]
+                    seen_items += len(batch)
+
+                    logger.info(f"Processed {seen_items}/{stats['total_items']} items (added: {stats['added_items']}, skipped: {stats['skipped_items']})")
+                    # Print progress every 10 seen items (even if all are skipped)
+                    try:
+                        while seen_items >= next_milestone and next_milestone > 0:
+                            sys.stderr.write(f"Processed: {next_milestone}/{stats['total_items']} added:{stats['added_items']} skipped:{stats['skipped_items']} errors:{stats['errors']}\n")
+                            next_milestone += 10
+                            if next_milestone > stats["total_items"]:
+                                next_milestone = stats["total_items"]
+                                break
+                    except Exception:
+                        pass
 
             # Update last update time
             self.update_config["last_update"] = datetime.now().isoformat()

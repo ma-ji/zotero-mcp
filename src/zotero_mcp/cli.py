@@ -432,11 +432,13 @@ def main():
 
             print(f"Embedding model: {search.chroma_client.get_embedding_description()}")
             print(
-                f"Embedding device: {search.chroma_client.get_embedding_device_description(ensure_pool=True, mark_reported=True)}"
+                f"Embedding device (configured): {search.chroma_client.get_embedding_device_description()}"
             )
             print("Starting database update...")
             if args.fulltext:
-                print("Note: --fulltext flag enabled. Will extract content from local database if available.")
+                print(
+                    "Note: --fulltext enabled. Fulltext extraction and embedding/indexing are pipelined to overlap work."
+                )
             stats = search.update_database(
                 force_full_rebuild=args.force_rebuild,
                 limit=args.limit,

@@ -480,9 +480,7 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         For multi-process embeddings this can optionally start the pool to resolve
         the actual target devices.
         """
-        pool = (
-            self._ensure_pool() if (ensure_pool and self._use_multi_process) else self._pool
-        )
+        pool = self._ensure_pool() if (ensure_pool and self._use_multi_process) else self._pool
         if pool is not None:
             target_devices = pool.get("target_devices") or self._target_devices
             if target_devices:
@@ -490,10 +488,13 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
             else:
                 desc = "multi-process (auto)"
         else:
-            # If multi-process is enabled but the pool isn't running (e.g. failed to start),
-            # embeddings fall back to `encode(..., device=self.device)`, not the model's load device.
+            # If multi-process is enabled but the pool isn't running yet, report the configured
+            # target devices so callers can see what will be used once embedding starts.
             if self._use_multi_process:
-                desc = str(self.device or "unknown")
+                if self._target_devices:
+                    desc = f"multi-process ({', '.join(self._target_devices)})"
+                else:
+                    desc = "multi-process (auto)"
             else:
                 desc = str(self._get_model_device_string() or self.device or "unknown")
 
@@ -575,7 +576,7 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
                 reported = str(self.device or "unknown")
             else:
                 reported = str(self._get_model_device_string() or self.device or "unknown")
-            line = f"Embedding device: {reported}\n"
+            line = f"Embedding device: {self._describe_single_device(reported)}\n"
 
         with self._device_report_lock:
             if self._reported_device == reported:
@@ -587,6 +588,62 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
             sys.stderr.flush()
         except Exception:
             pass
+
+    def _describe_single_device(self, device: str) -> str:
+        if not isinstance(device, str):
+            return str(device)
+        dev = device.strip()
+        if not dev.startswith("cuda"):
+            return dev
+        return self._describe_cuda_device(dev)
+
+    def _describe_cuda_device(self, device: str) -> str:
+        try:
+            import torch
+
+            idx: int | None = None
+            if ":" in device:
+                _, raw_idx = device.split(":", 1)
+                try:
+                    idx = int(raw_idx)
+                except ValueError:
+                    idx = None
+            if idx is None:
+                try:
+                    idx = int(torch.cuda.current_device())
+                except Exception:
+                    idx = None
+            if idx is None:
+                return device
+
+            name = torch.cuda.get_device_name(idx)
+            total = None
+            try:
+                props = torch.cuda.get_device_properties(idx)
+                total = float(props.total_memory) / (1024.0 * 1024.0)
+            except Exception:
+                total = None
+
+            alloc = None
+            reserved = None
+            try:
+                alloc = float(torch.cuda.memory_allocated(idx)) / (1024.0 * 1024.0)
+                reserved = float(torch.cuda.memory_reserved(idx)) / (1024.0 * 1024.0)
+            except Exception:
+                alloc = None
+                reserved = None
+
+            extra_parts = [name]
+            if alloc is not None and reserved is not None:
+                if total is not None:
+                    extra_parts.append(
+                        f"mem {alloc:.0f}/{reserved:.0f}/{total:.0f} MiB"
+                    )
+                else:
+                    extra_parts.append(f"mem {alloc:.0f}/{reserved:.0f} MiB")
+            return f"{device} ({'; '.join(extra_parts)})"
+        except Exception:
+            return device
 
     def _encode_with_oom_fallback(self, texts: list[str]):
         self._maybe_empty_cuda_cache()
