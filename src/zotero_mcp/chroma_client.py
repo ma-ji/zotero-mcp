@@ -131,16 +131,21 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
             env_var="ZOTERO_EMBEDDING_CHUNK_SIZE",
             default=None,
         )
-        self.device = self._resolve_embedding_device(
-            os.getenv("ZOTERO_EMBEDDING_DEVICE") or self.embedding_config.get("device")
+        raw_device = os.getenv("ZOTERO_EMBEDDING_DEVICE") or self.embedding_config.get(
+            "device"
         )
+        self._requested_device: Any = raw_device
+        self.device = self._resolve_embedding_device(raw_device)
 
         self._pool: dict[str, Any] | None = None
         self._pool_lock = Lock()
-        self._device_reported = False
+        self._reported_device: str | None = None
         self._device_report_lock = Lock()
-        self._target_devices = self._get_target_devices()
+        raw_target_devices = self._get_target_devices()
+        self._requested_target_devices: list[str] | None = raw_target_devices
+        self._target_devices = self._validate_target_devices(raw_target_devices)
         self._use_multi_process = self._resolve_multi_process_setting()
+        self._finalize_multi_process_settings()
 
         try:
             from sentence_transformers import SentenceTransformer
@@ -218,6 +223,99 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
             return [f"cuda:{p}" for p in parsed] or None
         return None
 
+    def _validate_target_devices(self, devices: list[str] | None) -> list[str] | None:
+        if not devices:
+            return None
+
+        validated: list[str] = []
+        for raw in devices:
+            if not isinstance(raw, str):
+                continue
+            dev = raw.strip().lower()
+            if not dev:
+                continue
+
+            if dev.isdigit():
+                dev = f"cuda:{dev}"
+
+            if dev in {"cpu"}:
+                validated.append("cpu")
+                continue
+
+            if dev in {"cuda", "gpu"} or dev.startswith("cuda:"):
+                resolved = self._validated_cuda_device(dev, emit_warnings=False)
+                if resolved.startswith("cuda"):
+                    validated.append(resolved)
+                continue
+
+            if dev.startswith("mps"):
+                resolved = self._validated_mps_device(dev, emit_warnings=False)
+                if resolved == "mps":
+                    validated.append("mps")
+                continue
+
+            # Unknown/unsupported device strings: keep as-is (lets upstream handle errors).
+            validated.append(dev)
+
+        validated = [d for i, d in enumerate(validated) if d and d not in validated[:i]]
+        return validated or None
+
+    def _finalize_multi_process_settings(self) -> None:
+        # If the user requested explicit target devices but none validated, it's always
+        # better to be explicit about falling back (and avoid starting a CPU pool).
+        if self._requested_target_devices and not self._target_devices:
+            try:
+                sys.stderr.write(
+                    "Warning: requested embedding devices "
+                    f"{', '.join(self._requested_target_devices)} but none are available; "
+                    f"falling back to single-process on {self.device}.\n"
+                )
+            except Exception:
+                pass
+            self._use_multi_process = False
+            return
+
+        # Multi-process embeddings are intended for multi-GPU. If only a single device
+        # is specified, prefer single-process execution on that device so the model is
+        # actually loaded there and device reporting stays intuitive.
+        if self._use_multi_process and self._target_devices and len(self._target_devices) == 1:
+            device = self._target_devices[0]
+            self.device = device
+            self._target_devices = None
+            self._use_multi_process = False
+            try:
+                sys.stderr.write(
+                    f"Note: multi-process embedding requested with a single device; using single-process on {device}.\n"
+                )
+            except Exception:
+                pass
+            return
+
+        if not self._use_multi_process:
+            return
+
+        # If multi-process is enabled without explicit devices, only enable it when
+        # multiple GPUs are actually available.
+        if not self._target_devices:
+            auto_devices = self._auto_cuda_target_devices()
+            if auto_devices and len(auto_devices) > 1:
+                self._target_devices = auto_devices
+            else:
+                self._use_multi_process = False
+
+    def _auto_cuda_target_devices(self) -> list[str] | None:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return None
+            count = int(torch.cuda.device_count())
+            if count <= 0:
+                return None
+            return [f"cuda:{i}" for i in range(count)]
+        except Exception:
+            return None
+
     def _resolve_embedding_device(self, raw_device: Any) -> str | None:
         if not isinstance(raw_device, str):
             device = None
@@ -254,25 +352,27 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
             pass
         return "cpu"
 
-    def _validated_cuda_device(self, device: str) -> str:
+    def _validated_cuda_device(self, device: str, *, emit_warnings: bool = True) -> str:
         try:
             import torch
         except Exception as e:
-            try:
-                sys.stderr.write(
-                    f"Warning: requested embedding device '{device}' but torch is unavailable; falling back to CPU ({e}).\n"
-                )
-            except Exception:
-                pass
+            if emit_warnings:
+                try:
+                    sys.stderr.write(
+                        f"Warning: requested embedding device '{device}' but torch is unavailable; falling back to CPU ({e}).\n"
+                    )
+                except Exception:
+                    pass
             return "cpu"
 
         if not torch.cuda.is_available():
-            try:
-                sys.stderr.write(
-                    f"Warning: requested embedding device '{device}' but CUDA is unavailable; falling back to CPU.\n"
-                )
-            except Exception:
-                pass
+            if emit_warnings:
+                try:
+                    sys.stderr.write(
+                        f"Warning: requested embedding device '{device}' but CUDA is unavailable; falling back to CPU.\n"
+                    )
+                except Exception:
+                    pass
             return "cpu"
 
         count = 0
@@ -281,12 +381,13 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         except Exception:
             count = 0
         if count <= 0:
-            try:
-                sys.stderr.write(
-                    f"Warning: requested embedding device '{device}' but no CUDA devices were found; falling back to CPU.\n"
-                )
-            except Exception:
-                pass
+            if emit_warnings:
+                try:
+                    sys.stderr.write(
+                        f"Warning: requested embedding device '{device}' but no CUDA devices were found; falling back to CPU.\n"
+                    )
+                except Exception:
+                    pass
             return "cpu"
 
         try:
@@ -304,17 +405,18 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
                 else:
                     raise ValueError(f"CUDA device index {parsed} out of range (count={count})")
             except Exception as e:
-                try:
-                    sys.stderr.write(
-                        f"Warning: requested embedding device '{device}' is invalid; using cuda:{current_idx} instead ({e}).\n"
-                    )
-                except Exception:
-                    pass
+                if emit_warnings:
+                    try:
+                        sys.stderr.write(
+                            f"Warning: requested embedding device '{device}' is invalid; using cuda:{current_idx} instead ({e}).\n"
+                        )
+                    except Exception:
+                        pass
                 index = current_idx
 
         return f"cuda:{index}"
 
-    def _validated_mps_device(self, device: str) -> str:
+    def _validated_mps_device(self, device: str, *, emit_warnings: bool = True) -> str:
         try:
             import torch
 
@@ -322,12 +424,13 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
                 raise RuntimeError("torch.backends.mps.is_available() is False")
             return "mps"
         except Exception as e:
-            try:
-                sys.stderr.write(
-                    f"Warning: requested embedding device '{device}' but MPS is unavailable; falling back to CPU ({e}).\n"
-                )
-            except Exception:
-                pass
+            if emit_warnings:
+                try:
+                    sys.stderr.write(
+                        f"Warning: requested embedding device '{device}' but MPS is unavailable; falling back to CPU ({e}).\n"
+                    )
+                except Exception:
+                    pass
             return "cpu"
 
     def _ensure_pool(self) -> dict[str, Any] | None:
@@ -377,24 +480,28 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         For multi-process embeddings this can optionally start the pool to resolve
         the actual target devices.
         """
-        if mark_reported:
-            with self._device_report_lock:
-                self._device_reported = True
-
-        pool = self._ensure_pool() if (ensure_pool and self._use_multi_process) else self._pool
+        pool = (
+            self._ensure_pool() if (ensure_pool and self._use_multi_process) else self._pool
+        )
         if pool is not None:
             target_devices = pool.get("target_devices") or self._target_devices
             if target_devices:
-                return f"multi-process ({', '.join(target_devices)})"
-            return "multi-process (auto)"
+                desc = f"multi-process ({', '.join(target_devices)})"
+            else:
+                desc = "multi-process (auto)"
+        else:
+            # If multi-process is enabled but the pool isn't running (e.g. failed to start),
+            # embeddings fall back to `encode(..., device=self.device)`, not the model's load device.
+            if self._use_multi_process:
+                desc = str(self.device or "unknown")
+            else:
+                desc = str(self._get_model_device_string() or self.device or "unknown")
 
-        if self._use_multi_process:
-            # When multi-process is enabled but the pool isn't running (e.g. failed to start),
-            # embeddings will fall back to single-process `encode(..., device=self.device)`.
-            return str(self.device or "unknown")
+        if mark_reported:
+            with self._device_report_lock:
+                self._reported_device = desc
 
-        device = self._get_model_device_string() or self.device or "unknown"
-        return str(device)
+        return desc
 
     def _get_model_device_string(self) -> str | None:
         try:
@@ -455,20 +562,28 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         )
 
     def _report_runtime_device(self, pool: dict[str, Any] | None) -> None:
+        if pool is not None:
+            target_devices = pool.get("target_devices") or self._target_devices
+            if target_devices:
+                reported = f"multi-process ({', '.join(target_devices)})"
+                line = f"Embedding devices: {', '.join(target_devices)}\n"
+            else:
+                reported = "multi-process (auto)"
+                line = "Embedding devices: (multi-process auto)\n"
+        else:
+            if self._use_multi_process:
+                reported = str(self.device or "unknown")
+            else:
+                reported = str(self._get_model_device_string() or self.device or "unknown")
+            line = f"Embedding device: {reported}\n"
+
         with self._device_report_lock:
-            if self._device_reported:
+            if self._reported_device == reported:
                 return
-            self._device_reported = True
+            self._reported_device = reported
 
         try:
-            if pool is not None:
-                target_devices = pool.get("target_devices") or self._target_devices
-                if target_devices:
-                    sys.stderr.write(f"Embedding devices: {', '.join(target_devices)}\n")
-                else:
-                    sys.stderr.write("Embedding devices: (multi-process auto)\n")
-            else:
-                sys.stderr.write(f"Embedding device: {self.get_runtime_device_description()}\n")
+            sys.stderr.write(line)
             sys.stderr.flush()
         except Exception:
             pass
@@ -479,7 +594,10 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
 
         last_exc: Exception | None = None
         device = self.device
-        if isinstance(device, str) and device.strip().lower() not in {"cpu"}:
+        tried_accelerator = isinstance(device, str) and device.strip().lower() not in {
+            "cpu"
+        }
+        if tried_accelerator:
             for bs in self._candidate_batch_sizes(self.batch_size or 32):
                 try:
                     return self.model.encode(
@@ -495,11 +613,23 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
                         raise
                     self._maybe_empty_cuda_cache()
 
-        # Final fallback: CPU with small batch size.
+        if tried_accelerator:
+            try:
+                sys.stderr.write(
+                    f"Warning: embedding ran out of memory on {device}; falling back to CPU.\n"
+                )
+            except Exception:
+                pass
+
+        # Final fallback: CPU with small batch size (and keep CPU for the rest of the run).
+        self._use_multi_process = False
+        self._target_devices = None
+        self.device = "cpu"
         try:
             self.model.to("cpu")
         except Exception:
             pass
+        self._report_runtime_device(None)
         for bs in (8, 4, 2, 1):
             try:
                 return self.model.encode(
