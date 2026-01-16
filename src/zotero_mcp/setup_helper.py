@@ -280,7 +280,7 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
 
         print("\n=== Embedding Performance Settings (Advanced) ===")
         print("These settings apply to local sentence-transformers models (default/HuggingFace).")
-        print("If you hit CUDA OOM, reduce batch size and/or disable multi-process.")
+        print("If you hit CUDA OOM, reduce batch size and/or restrict devices.")
 
         default_batch = existing_embedding_config.get("batch_size", 32)
         while True:
@@ -297,15 +297,7 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
             except ValueError:
                 print("Please enter a valid number")
 
-        default_multi = bool(existing_embedding_config.get("multi_process", False))
-        mp_hint = "Y/n" if default_multi else "y/N"
-        raw = input(f"Enable multi-process embedding (multi-GPU) [{mp_hint}]: ").strip().lower()
-        if raw == "":
-            embedding_cfg["multi_process"] = default_multi
-        else:
-            embedding_cfg["multi_process"] = raw in {"y", "yes", "true", "1"}
-
-        # Optional chunk size (helps control memory when multi_process=True)
+        # Optional chunk size (helps control memory for large batches)
         default_chunk = existing_embedding_config.get("chunk_size")
         raw = input(f"Embedding chunk size (optional) [{default_chunk or 'auto'}]: ").strip()
         if raw == "":
@@ -319,32 +311,45 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
             except ValueError:
                 print("Warning: invalid chunk size, using auto")
 
-        # Devices: for multi-process use devices/gpu_ids; for single-process use device
-        # Clear old settings first so config reflects the user's choice.
+        # Device selection: a single device uses single-process; multiple devices use the
+        # sentence-transformers multi-process pool.
+        default_device_setting = ""
+        if isinstance(existing_embedding_config.get("devices"), list):
+            default_device_setting = ",".join(str(d) for d in existing_embedding_config["devices"])
+        elif isinstance(existing_embedding_config.get("gpu_ids"), list):
+            default_device_setting = ",".join(str(d) for d in existing_embedding_config["gpu_ids"])
+        elif isinstance(existing_embedding_config.get("gpu_ids"), str):
+            default_device_setting = existing_embedding_config.get("gpu_ids", "")
+        elif isinstance(existing_embedding_config.get("device"), str):
+            default_device_setting = existing_embedding_config.get("device", "")
+
+        raw = input(
+            "Embedding device(s) (optional, comma-separated for multi-GPU) "
+            f"[{default_device_setting or 'auto'}]: "
+        ).strip()
+
         embedding_cfg.pop("devices", None)
         embedding_cfg.pop("gpu_ids", None)
         embedding_cfg.pop("device", None)
 
-        if embedding_cfg.get("multi_process"):
-            default_devices = existing_embedding_config.get("devices")
-            if isinstance(default_devices, list):
-                default_devices_str = ",".join(str(d) for d in default_devices)
-            else:
-                default_devices_str = ""
-            raw = input(
-                f"Embedding devices (comma-separated, optional) [{default_devices_str or 'auto'}]: "
-            ).strip()
-            if raw:
-                parts = [p.strip() for p in raw.split(",") if p.strip()]
-                if parts and all(p.isdigit() for p in parts):
-                    embedding_cfg["gpu_ids"] = [int(p) for p in parts]
-                else:
-                    embedding_cfg["devices"] = parts
+        if raw == "":
+            if isinstance(existing_embedding_config.get("devices"), list):
+                embedding_cfg["devices"] = existing_embedding_config["devices"]
+            elif isinstance(existing_embedding_config.get("gpu_ids"), list):
+                embedding_cfg["gpu_ids"] = existing_embedding_config["gpu_ids"]
+            elif isinstance(existing_embedding_config.get("gpu_ids"), str) and existing_embedding_config.get("gpu_ids", "").strip():
+                embedding_cfg["gpu_ids"] = existing_embedding_config["gpu_ids"]
+            elif isinstance(existing_embedding_config.get("device"), str) and existing_embedding_config.get("device", "").strip():
+                embedding_cfg["device"] = existing_embedding_config["device"]
         else:
-            default_device = existing_embedding_config.get("device", "")
-            raw = input(f"Embedding device (optional) [{default_device or 'auto'}]: ").strip()
-            if raw:
-                embedding_cfg["device"] = raw
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            normalized: list[str] = []
+            for part in parts:
+                normalized.append(f"cuda:{part}" if part.isdigit() else part)
+            if len(normalized) > 1:
+                embedding_cfg["devices"] = normalized
+            elif normalized:
+                embedding_cfg["device"] = normalized[0]
 
     # Configure update frequency
     print("\n=== Database Update Configuration ===")
@@ -397,11 +402,16 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
         }
         print(f"Database will be updated every {days} days.")
 
-    # Configure extraction settings
-    print("\n=== Content Extraction Settings ===")
+    # Configure fulltext pipeline settings
+    print("\n=== Fulltext Pipeline Settings ===")
     print("Set a page cap for PDF extraction to balance speed vs. coverage.")
     print("Press Enter to use the default.")
-    default_pdf_max = existing_semantic_config.get("extraction", {}).get("pdf_max_pages", 10) if existing_semantic_config else 10
+    existing_fulltext_config = (existing_semantic_config or {}).get("fulltext", {}) or {}
+    legacy_extraction_config = (existing_semantic_config or {}).get("extraction", {}) or {}
+    default_pdf_max = existing_fulltext_config.get(
+        "pdf_max_pages",
+        legacy_extraction_config.get("pdf_max_pages", 10),
+    )
     while True:
         raw = input(f"PDF max pages [{default_pdf_max}]: ").strip()
         if raw == "":
@@ -415,23 +425,28 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
         except ValueError:
             print("Please enter a valid number")
 
-    existing_extraction_config = (existing_semantic_config or {}).get("extraction", {}) or {}
-    print("\nParallel extraction can speed up `update-db --fulltext` but uses more CPU/RAM/GPU.")
-    default_workers = existing_extraction_config.get("workers", 1)
+    print("\nMore pipelines can speed up `update-db --fulltext` but uses more CPU/RAM/GPU.")
+    default_pipelines = existing_fulltext_config.get(
+        "pipelines",
+        legacy_extraction_config.get("workers", 1),
+    )
     while True:
-        raw = input(f"Fulltext extraction workers [{default_workers}]: ").strip()
+        raw = input(f"Pipelines [{default_pipelines}]: ").strip()
         if raw == "":
-            extraction_workers = default_workers
+            pipelines = default_pipelines
             break
         try:
-            extraction_workers = int(raw)
-            if extraction_workers > 0:
+            pipelines = int(raw)
+            if pipelines > 0:
                 break
             print("Please enter a positive integer")
         except ValueError:
             print("Please enter a valid number")
 
-    default_device = existing_extraction_config.get("docling_device", "auto")
+    default_device = existing_fulltext_config.get(
+        "docling_device",
+        legacy_extraction_config.get("docling_device", "auto"),
+    )
     while True:
         raw = input(f"Docling device (auto/cpu/cuda/mps) [{default_device}]: ").strip().lower()
         if raw == "":
@@ -442,7 +457,10 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
             break
         print("Please enter one of: auto, cpu, cuda, mps")
 
-    default_threads = existing_extraction_config.get("docling_num_threads", 4)
+    default_threads = existing_fulltext_config.get(
+        "docling_num_threads",
+        legacy_extraction_config.get("docling_num_threads", 4),
+    )
     while True:
         raw = input(f"Docling num threads [{default_threads}]: ").strip()
         if raw == "":
@@ -456,19 +474,24 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
         except ValueError:
             print("Please enter a valid number")
 
-    default_gpu_ids = existing_extraction_config.get("gpu_ids")
+    default_gpu_ids = existing_fulltext_config.get(
+        "docling_gpu_ids",
+        legacy_extraction_config.get("gpu_ids"),
+    )
     if isinstance(default_gpu_ids, list):
         default_gpu_ids_str = ",".join(str(x) for x in default_gpu_ids)
     elif isinstance(default_gpu_ids, str):
         default_gpu_ids_str = default_gpu_ids
     else:
         default_gpu_ids_str = ""
-    raw = input(f"Docling GPU ids (optional, comma-separated) [{default_gpu_ids_str or 'auto'}]: ").strip()
-    gpu_ids = None
+    raw = input(
+        f"Docling GPU ids/devices (optional, comma-separated; e.g. 0,1 or cuda:0,cuda:1) [{default_gpu_ids_str or 'auto'}]: "
+    ).strip()
+    docling_gpu_ids = None
     if raw:
-        gpu_ids = [p.strip() for p in raw.split(",") if p.strip()]
-        if gpu_ids and all(p.isdigit() for p in gpu_ids):
-            gpu_ids = [int(p) for p in gpu_ids]
+        docling_gpu_ids = [p.strip() for p in raw.split(",") if p.strip()]
+        if docling_gpu_ids and all(p.isdigit() for p in docling_gpu_ids):
+            docling_gpu_ids = [int(p) for p in docling_gpu_ids]
 
     # Configure Zotero database path
     print("\n=== Zotero Database Path ===")
@@ -495,15 +518,15 @@ def setup_semantic_search(existing_semantic_config: dict = None, semantic_config
         print("Using auto-detect for Zotero database location.")
 
     config["update_config"] = update_config
-    extraction_config = {
+    fulltext_config = {
         "pdf_max_pages": pdf_max_pages,
-        "workers": extraction_workers,
+        "pipelines": pipelines,
         "docling_device": docling_device,
         "docling_num_threads": docling_num_threads,
     }
-    if gpu_ids:
-        extraction_config["gpu_ids"] = gpu_ids
-    config["extraction"] = extraction_config
+    if docling_gpu_ids:
+        fulltext_config["docling_gpu_ids"] = docling_gpu_ids
+    config["fulltext"] = fulltext_config
     if zotero_db_path:
         config["zotero_db_path"] = zotero_db_path
 

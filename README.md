@@ -259,17 +259,15 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 To override the Zotero database path, use `zotero-mcp update-db --db-path ...` or set `semantic_search.zotero_db_path` in `~/.config/zotero-mcp/config.json` (created by `zotero-mcp setup`).
 
 **Performance / Parallelism (advanced):**
-- `ZOTERO_PDF_MAXPAGES`: Max PDF pages for extraction when config doesn't set `semantic_search.extraction.pdf_max_pages` (default: `10`)
-- `ZOTERO_FULLTEXT_WORKERS`: Worker processes for `update-db --fulltext` extraction (default: `1`)
+- `ZOTERO_PDF_MAXPAGES`: Max PDF pages for extraction when config doesn't set `semantic_search.fulltext.pdf_max_pages` (default: `10`)
+- `ZOTERO_PIPELINES`: Concurrent extract→embed pipelines for `update-db --fulltext` (default: `1`)
 - `ZOTERO_DOCLING_DEVICE`: Docling device (`auto`, `cpu`, `cuda`, `mps`) (default: `auto`)
 - `ZOTERO_DOCLING_NUM_THREADS`: Docling threads per worker process (default: `4`)
-- `ZOTERO_DOCLING_GPU_IDS`: Comma-separated GPU ids for Docling extraction workers (e.g. `0,1`) (default: auto-detect from `CUDA_VISIBLE_DEVICES`/available GPUs)
+- `ZOTERO_DOCLING_GPU_IDS`: Comma-separated GPU ids/devices for Docling extraction workers (e.g. `0,1` or `cuda:0,cuda:1`) (default: auto-detect from `CUDA_VISIBLE_DEVICES`/available GPUs)
 - `ZOTERO_EMBEDDING_DEVICE`: Local embedding device (e.g. `cpu`, `cuda`, `cuda:0`) (default: `auto`)
 - `ZOTERO_EMBEDDING_BATCH_SIZE`: Local embedding batch size (default: `32`; lower helps avoid OOM)
-- `ZOTERO_EMBEDDING_CHUNK_SIZE`: Local embedding chunk size (multi-process) (default: `auto`)
-- `ZOTERO_EMBEDDING_MULTI_PROCESS`: Enable multi-process embedding (`true/false`) (default: `false`)
-- `ZOTERO_EMBEDDING_DEVICES`: Comma-separated embedding devices (e.g. `cuda:0,cuda:1`) (default: unset)
-- `ZOTERO_EMBEDDING_GPU_IDS`: Comma-separated GPU ids for embedding (e.g. `0,1`) (default: unset)
+- `ZOTERO_EMBEDDING_CHUNK_SIZE`: Local embedding chunk size (default: `auto`)
+- `ZOTERO_EMBEDDING_DEVICES`: Comma-separated embedding devices (e.g. `cuda:0,cuda:1`) (default: unset; set 2+ devices for multi-GPU embeddings)
 
 ### Semantic Search Config File
 
@@ -280,22 +278,21 @@ Defaults (when keys are missing):
 ```json
 {
   "semantic_search": {
-    "extraction": {
+    "fulltext": {
       "pdf_max_pages": 10,
-      "workers": 1,
+      "pipelines": 1,
       "docling_device": "auto",
       "docling_num_threads": 4
     },
     "embedding_config": {
       "batch_size": 32,
-      "chunk_size": null,
-      "multi_process": false
+      "chunk_size": null
     }
   }
 }
 ```
 
-Optional: set `semantic_search.extraction.gpu_ids` to pin Docling workers, and (for local embeddings) `semantic_search.embedding_config.devices`/`semantic_search.embedding_config.gpu_ids` to use multiple GPUs.
+Optional: set `semantic_search.fulltext.docling_gpu_ids` to pin Docling workers, and (for local embeddings) `semantic_search.embedding_config.devices` to use multiple GPUs.
 
 ### Command-Line Options
 
@@ -322,8 +319,8 @@ zotero-mcp update-db --fulltext             # Update with full-text extraction (
 zotero-mcp update-db --force-rebuild       # Force complete database rebuild
 zotero-mcp update-db --fulltext --force-rebuild  # Rebuild with full-text extraction
 zotero-mcp update-db --fulltext --db-path "your_path_to/zotero.sqlite" # Customize your zotero database path
-zotero-mcp update-db --fulltext --fulltext-workers 4 --docling-gpu-ids "0,1"  # Parallel fulltext extraction across GPUs
-zotero-mcp update-db --embedding-multi-process --embedding-devices "cuda:0,cuda:1"  # Multi-GPU local embeddings
+zotero-mcp update-db --fulltext --pipelines 4 --docling-gpu-ids "cuda:0,cuda:1"  # Parallel fulltext extraction across GPUs
+zotero-mcp update-db --embedding-devices "cuda:0,cuda:1"  # Multi-GPU local embeddings
 zotero-mcp db-status                       # Show database status and info
 
 # General
@@ -334,17 +331,16 @@ zotero-mcp version                         # Show current version
 
 Defaults apply when the flag/env/config isn't set. Precedence is: CLI flags > env vars > `~/.config/zotero-mcp/config.json` > built-in defaults.
 
-- `--fulltext-workers`: Fulltext extraction worker processes (default: `1`)
+- `--pipelines`: Concurrent extract→embed pipelines for `--fulltext` (default: `1`)
 - `--docling-device`: Docling accelerator device (`auto|cpu|cuda|mps`, default: `auto`)
 - `--docling-num-threads`: Docling threads per worker process (default: `4`)
-- `--docling-gpu-ids`: Comma-separated GPU ids for Docling worker pinning (default: auto-detect)
+- `--docling-gpu-ids`: Comma-separated GPU ids/devices for Docling worker pinning (e.g. `0,1` or `cuda:0,cuda:1`, default: auto-detect)
 - `--embedding-device`: Local embedding device (default: `auto`)
 - `--embedding-batch-size`: Local embedding batch size (default: `32`)
 - `--embedding-chunk-size`: Local embedding chunk size (default: `auto`)
-- `--embedding-multi-process`: Enable multi-process embedding (default: `false`)
-- `--embedding-devices`: Comma-separated embedding devices (default: unset; setting this enables multi-process embedding)
+- `--embedding-devices`: Comma-separated embedding devices (default: unset; setting 2+ devices enables multi-GPU embeddings)
 
-OOM tips: reduce `--fulltext-workers` / `--embedding-batch-size`, or force CPU with `--docling-device cpu` / `--embedding-device cpu`.
+OOM tips: reduce `--pipelines` / `--embedding-batch-size`, or force CPU with `--docling-device cpu` / `--embedding-device cpu`.
 
 ## 📑 PDF Annotation Extraction
 

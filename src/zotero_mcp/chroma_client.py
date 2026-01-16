@@ -144,7 +144,7 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         raw_target_devices = self._get_target_devices()
         self._requested_target_devices: list[str] | None = raw_target_devices
         self._target_devices = self._validate_target_devices(raw_target_devices)
-        self._use_multi_process = self._resolve_multi_process_setting()
+        self._use_multi_process = bool(self._target_devices and len(self._target_devices) > 1)
         self._finalize_multi_process_settings()
 
         try:
@@ -261,8 +261,8 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         return validated or None
 
     def _finalize_multi_process_settings(self) -> None:
-        # If the user requested explicit target devices but none validated, it's always
-        # better to be explicit about falling back (and avoid starting a CPU pool).
+        # If the user requested explicit target devices but none validated, be explicit
+        # about falling back and avoid starting a misconfigured pool.
         if self._requested_target_devices and not self._target_devices:
             try:
                 sys.stderr.write(
@@ -273,48 +273,19 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
             except Exception:
                 pass
             self._use_multi_process = False
+            self._target_devices = None
             return
 
-        # Multi-process embeddings are intended for multi-GPU. If only a single device
-        # is specified, prefer single-process execution on that device so the model is
-        # actually loaded there and device reporting stays intuitive.
-        if self._use_multi_process and self._target_devices and len(self._target_devices) == 1:
-            device = self._target_devices[0]
-            self.device = device
+        # If a single device is specified via the multi-device setting, treat it as
+        # an alias for `device` so callers can pass `--embedding-devices cuda:1`.
+        if self._target_devices and len(self._target_devices) == 1:
+            self.device = self._target_devices[0]
             self._target_devices = None
             self._use_multi_process = False
-            try:
-                sys.stderr.write(
-                    f"Note: multi-process embedding requested with a single device; using single-process on {device}.\n"
-                )
-            except Exception:
-                pass
             return
 
-        if not self._use_multi_process:
-            return
-
-        # If multi-process is enabled without explicit devices, only enable it when
-        # multiple GPUs are actually available.
-        if not self._target_devices:
-            auto_devices = self._auto_cuda_target_devices()
-            if auto_devices and len(auto_devices) > 1:
-                self._target_devices = auto_devices
-            else:
-                self._use_multi_process = False
-
-    def _auto_cuda_target_devices(self) -> list[str] | None:
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                return None
-            count = int(torch.cuda.device_count())
-            if count <= 0:
-                return None
-            return [f"cuda:{i}" for i in range(count)]
-        except Exception:
-            return None
+        # Multi-process is only used when multiple target devices are specified.
+        self._use_multi_process = bool(self._target_devices and len(self._target_devices) > 1)
 
     def _resolve_embedding_device(self, raw_device: Any) -> str | None:
         if not isinstance(raw_device, str):
@@ -327,6 +298,9 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
 
         if device == "gpu":
             device = "cuda"
+
+        if isinstance(device, str) and device.isdigit():
+            device = f"cuda:{device}"
 
         if device.startswith("cuda"):
             return self._validated_cuda_device(device)
@@ -455,21 +429,6 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
                         pass
                     self._pool = None
         return self._pool
-
-    def _resolve_multi_process_setting(self) -> bool:
-        raw = os.getenv("ZOTERO_EMBEDDING_MULTI_PROCESS")
-        if isinstance(raw, str) and raw.strip():
-            lowered = raw.strip().lower()
-            if lowered in {"1", "true", "yes", "on"}:
-                return True
-            if lowered in {"0", "false", "no", "off"}:
-                return False
-
-        cfg = self.embedding_config.get("multi_process")
-        if isinstance(cfg, bool):
-            return cfg
-
-        return bool(self._target_devices and len(self._target_devices) > 1)
 
     def get_runtime_device_description(
         self, *, ensure_pool: bool = False, mark_reported: bool = False
@@ -1045,6 +1004,31 @@ class ChromaClient:
             return None
         except Exception:
             return None
+
+    def get_documents_metadata(self, doc_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """
+        Batch metadata lookup for many documents.
+
+        Args:
+            doc_ids: Document IDs to look up
+
+        Returns:
+            Mapping of doc_id -> metadata for documents that exist.
+        """
+        if not doc_ids:
+            return {}
+
+        try:
+            result = self.collection.get(ids=doc_ids, include=["metadatas"])
+            ids = result.get("ids") or []
+            metadatas = result.get("metadatas") or []
+            out: dict[str, dict[str, Any]] = {}
+            for doc_id, meta in zip(ids, metadatas):
+                if doc_id:
+                    out[str(doc_id)] = meta or {}
+            return out
+        except Exception:
+            return {}
 
 
 def create_chroma_client(config_path: str | None = None) -> ChromaClient:

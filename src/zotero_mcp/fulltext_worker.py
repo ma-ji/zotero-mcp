@@ -31,9 +31,16 @@ def init_fulltext_worker(
         try:
             ident = getattr(current_process(), "_identity", None) or ()
             worker_index = (ident[0] - 1) if ident else 0
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(
-                gpu_ids[worker_index % len(gpu_ids)]
-            )
+            selected = gpu_ids[worker_index % len(gpu_ids)]
+            if isinstance(selected, str):
+                cleaned = selected.strip()
+                lowered = cleaned.lower()
+                if lowered.startswith("cuda:"):
+                    suffix = lowered.split(":", 1)[1].strip()
+                    if suffix.isdigit():
+                        cleaned = suffix
+                selected = cleaned
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(selected)
         except Exception as e:
             logger.debug("Failed to set CUDA_VISIBLE_DEVICES: %s", e)
 
